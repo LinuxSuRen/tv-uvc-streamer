@@ -1,5 +1,8 @@
 package com.linuxsuren.tvuvc;
 
+import android.content.Context;
+import android.content.Intent;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -11,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -24,6 +28,21 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  */
 public final class MjpegServer {
+
+    /** 帧订阅者（RTSP 等其他服务消费同一路帧流） */
+    public interface FrameListener {
+        void onFrame(byte[] frame, long frameIndex);
+    }
+
+    private static final List<FrameListener> LISTENERS = new CopyOnWriteArrayList<>();
+
+    public static void addListener(FrameListener listener) {
+        LISTENERS.add(listener);
+    }
+
+    public static void removeListener(FrameListener listener) {
+        LISTENERS.remove(listener);
+    }
 
     public static final int PORT = 8090;
     private static final String BOUNDARY = "tvuvcframe";
@@ -73,15 +92,30 @@ public final class MjpegServer {
         if (frame == null || frame.length < 2) {
             return;
         }
-        FRAME_COUNT.incrementAndGet();
+        long index = FRAME_COUNT.incrementAndGet();
         synchronized (LOCK) {
             latest = frame;
             LOCK.notifyAll();
+        }
+        for (FrameListener l : LISTENERS) {
+            l.onFrame(frame, index);
         }
     }
 
     public static long frameCount() {
         return FRAME_COUNT.get();
+    }
+
+    /** 供自愈任务调用：服务未运行时直接拉起采集服务。 */
+    public static void ensureRunning(Context context) {
+        if (serverSocket == null) {
+            Intent intent = new Intent(context, StreamService.class);
+            try {
+                context.startService(intent);
+            } catch (IllegalStateException ignored) {
+                // Android 8+ 后台启动限制；本项目目标 Android 6 不会走到
+            }
+        }
     }
 
     /** 取本机局域网 IPv4 地址，用于展示访问入口。 */
