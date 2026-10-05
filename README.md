@@ -1,6 +1,6 @@
 # tv-uvc-streamer
 
-Android TV 上的 UVC USB 摄像头转流网关。插入 UVC 摄像头，在电视上同时输出 HTTP MJPEG 与 RTSP 流，并可通过 ONVIF 自动发现，供局域网内任意设备（OpenCV / ffmpeg / 浏览器 / NVR / Frigate）拉流处理。
+Android 设备上的 UVC USB 摄像头转流网关（电视 / 手机 / 平板通用）。插入 UVC 摄像头，设备同时输出 HTTP MJPEG 与 RTSP 流，并可通过 ONVIF 自动发现，供局域网内任意设备（OpenCV / ffmpeg / 浏览器 / NVR / Frigate）拉流处理。
 
 ## 背景
 
@@ -42,11 +42,18 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ## 使用
 
-1. 电视上插入 USB 摄像头，首次弹出授权对话框时允许（此后免授权）
+1. 插入 USB 摄像头（手机需 OTG 线/转接器），首次弹出授权对话框时允许（此后免授权）
 2. 摄像头插入/重插会经 USB ATTACH 广播直接拉起后台服务（不经界面）
 3. 服务持有 WakeLock + WifiLock，熄屏后持续可用（需系统 WiFi 休眠策略为"永不"）
 
-## MIUI 兼容性说明（重要）
+## 机型通用性
+
+- **双架构**：armeabi-v7a + arm64-v8a，覆盖主流电视与手机（含仅 64 位的新旗舰）
+- **统一纯后台**：所有机型走纯后台 Service（targetSdk 23 豁免 API 26+ 后台启动限制；新系统可能提示"后台运行中"，不影响功能）
+- **入口通用**：手机桌面图标 + Android TV / Google TV Leanback 启动器入口
+- 手机长时间推流建议插电；MIUI 手机建议在系统设置中允许自启动与后台无限制
+
+## MIUI 电视兼容性说明（重要）
 
 - MIUI TV 会在应用离开前台时以「free resource」强杀带前台 Activity 的应用（TvMgr-MemoryAutoKill），且禁止第三方应用前台服务与开机广播
 - 应对策略：授权后 Activity 立即 finish，全部工作由纯后台 Service 承担；USB ATTACH 广播直启服务；JobScheduler（15 分钟周期、persisted）自愈

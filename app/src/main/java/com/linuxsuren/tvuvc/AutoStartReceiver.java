@@ -20,7 +20,7 @@ public class AutoStartReceiver extends BroadcastReceiver {
             UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
             UsbDevice camera = StreamService.findCamera(usbManager);
             if (camera != null && usbManager.hasPermission(camera)) {
-                context.startService(new Intent(context, StreamService.class));
+                StreamService.start(context);
             } else if ("android.hardware.usb.action.USB_DEVICE_ATTACHED".equals(action)) {
                 // 无授权记录：拉起界面走授权流程
                 Intent ui = new Intent(context, MainActivity.class);
