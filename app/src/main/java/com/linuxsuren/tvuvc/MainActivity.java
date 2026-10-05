@@ -6,50 +6,31 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbDeviceConnection;
-import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
-import android.view.WindowManager;
 import android.widget.TextView;
 
-import java.util.HashMap;
-
 /**
- * 入口页：负责 USB 摄像头授权与采集/服务生命周期管理。
+ * 授权入口：完成 USB 摄像头授权后启动 {@link StreamService} 并立即 finish，
+ * 让进程成为纯后台 Service（规避 MIUI 前台切换强杀）。
  */
 public class MainActivity extends Activity {
 
     private static final String ACTION_USB_PERMISSION = "com.linuxsuren.tvuvc.USB_PERMISSION";
-    private static final int WANT_WIDTH = 1280;
-    private static final int WANT_HEIGHT = 720;
-    private static final int WANT_FPS = 25;
 
     private UsbManager usbManager;
     private TextView statusView;
-    private boolean running;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (ACTION_USB_PERMISSION.equals(action)) {
+            if (ACTION_USB_PERMISSION.equals(intent.getAction())) {
                 boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
-                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                if (granted && device != null) {
-                    startCapture(device);
+                if (granted) {
+                    startStreamService();
                 } else {
-                    setStatus("USB 授权被拒绝");
-                }
-            } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
-                ensureCamera();
-            } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
-                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                if (device != null && running) {
-                    stopCapture();
-                    setStatus("摄像头已拔出");
+                    statusView.setText("USB 授权被拒绝");
                 }
             }
         }
@@ -59,105 +40,40 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         statusView = findViewById(R.id.status);
         usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
-
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(ACTION_USB_PERMISSION);
-        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
-        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
-        registerReceiver(receiver, filter);
+        registerReceiver(receiver, new IntentFilter(ACTION_USB_PERMISSION));
     }
 
     @Override
     protected void onStart() {
         super.onStart();
-        ensureCamera();
-    }
-
-    @Override
-    protected void onDestroy() {
-        stopCapture();
-        unregisterReceiver(receiver);
-        super.onDestroy();
-    }
-
-    private UsbDevice findCamera() {
-        HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
-        for (UsbDevice device : devices.values()) {
-            for (int i = 0; i < device.getInterfaceCount(); i++) {
-                UsbInterface iface = device.getInterface(i);
-                if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_VIDEO) {
-                    return device;
-                }
-            }
-        }
-        return null;
-    }
-
-    private void ensureCamera() {
-        if (running) {
-            return;
-        }
-        UsbDevice camera = findCamera();
+        UsbDevice camera = StreamService.findCamera(usbManager);
         if (camera == null) {
-            setStatus("未发现 USB 摄像头，请插入后等待授权弹窗");
+            statusView.setText("未发现 USB 摄像头，请插入");
             return;
         }
         if (usbManager.hasPermission(camera)) {
-            startCapture(camera);
+            startStreamService();
             return;
         }
         PendingIntent pi = PendingIntent.getBroadcast(this, 0,
                 new Intent(ACTION_USB_PERMISSION), 0);
         usbManager.requestPermission(camera, pi);
-        setStatus("等待 USB 授权确认…");
+        statusView.setText("等待 USB 授权确认…");
     }
 
-    private void startCapture(final UsbDevice device) {
-        if (running) {
-            return;
-        }
-        final UsbDeviceConnection connection = usbManager.openDevice(device);
-        if (connection == null) {
-            setStatus("打开设备失败");
-            return;
-        }
-        final int fd = connection.getFileDescriptor();
-        new Thread(() -> {
-            boolean ok = UvcCapture.nativeStart(fd, WANT_WIDTH, WANT_HEIGHT, WANT_FPS);
-            runOnUiThread(() -> {
-                if (ok) {
-                    running = true;
-                    try {
-                        MjpegServer.start();
-                        setStatus("采集中 " + WANT_WIDTH + "x" + WANT_HEIGHT
-                                + "\n流地址 " + MjpegServer.url() + "stream"
-                                + "\n快照 " + MjpegServer.url() + "snapshot.jpg");
-                    } catch (Exception e) {
-                        UvcCapture.nativeStop();
-                        setStatus("HTTP 服务启动失败: " + e.getMessage());
-                    }
-                } else {
-                    connection.close();
-                    setStatus("采集启动失败（检查摄像头是否支持 MJPEG "
-                            + WANT_WIDTH + "x" + WANT_HEIGHT + "）");
-                }
-            });
-        }, "uvc-start").start();
+    private void startStreamService() {
+        KeepAliveJob.schedule(this);
+        startService(new Intent(this, StreamService.class));
+        statusView.setText("已转后台服务\nRTSP " + RtspServer.url()
+                + "\nMJPEG " + MjpegServer.url() + "stream");
+        finish();
     }
 
-    private synchronized void stopCapture() {
-        if (!running) {
-            return;
-        }
-        running = false;
-        MjpegServer.stop();
-        UvcCapture.nativeStop();
-    }
-
-    private void setStatus(String text) {
-        statusView.setText(text);
+    @Override
+    protected void onDestroy() {
+        unregisterReceiver(receiver);
+        super.onDestroy();
     }
 }

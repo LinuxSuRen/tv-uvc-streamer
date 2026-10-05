@@ -9,8 +9,14 @@
  */
 #include <jni.h>
 #include <android/log.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 #include <libusb.h>          /* 需先于 libuvc.h：提供 LIBUSB_API_VERSION（uvc_wrap 声明守卫依赖） */
 #include <libuvc/libuvc.h>
+
+#ifndef USBDEVFS_RESET
+#define USBDEVFS_RESET _IO('U', 20)
+#endif
 
 #define LOG_TAG "tv-uvc-streamer"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -60,6 +66,45 @@ static void frame_cb(uvc_frame_t *frame, void *user) {
     }
 }
 
+/* 打开并启动一次流；失败时调用方负责 close_all 清理 */
+static uvc_error_t open_and_stream(int fd, int width, int height, int fps) {
+    uvc_error_t rc = uvc_wrap(fd, g_ctx, &g_devh);
+    if (rc != UVC_SUCCESS) {
+        LOGE("uvc_wrap(fd=%d) failed: %d", fd, rc);
+        return rc;
+    }
+    LOGI("uvc_wrap ok, negotiating MJPEG %dx%d@%d", width, height, fps);
+
+    uvc_stream_ctrl_t ctrl;
+    rc = uvc_get_stream_ctrl_format_size(g_devh, &ctrl, UVC_FRAME_FORMAT_MJPEG,
+                                         width, height, fps);
+    if (rc != UVC_SUCCESS) {
+        LOGE("negotiate format failed: %d", rc);
+        return rc;
+    }
+    g_streaming = 1;
+    rc = uvc_start_streaming(g_devh, &ctrl, frame_cb, NULL, 0);
+    if (rc != UVC_SUCCESS) {
+        g_streaming = 0;
+        LOGE("uvc_start_streaming failed: %d", rc);
+        return rc;
+    }
+    LOGI("streaming started");
+    return UVC_SUCCESS;
+}
+
+static void close_all(void) {
+    if (g_devh != NULL) {
+        uvc_stop_streaming(g_devh);
+        uvc_close(g_devh);
+        g_devh = NULL;
+    }
+    if (g_ctx != NULL) {
+        uvc_exit(g_ctx);
+        g_ctx = NULL;
+    }
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_linuxsuren_tvuvc_UvcCapture_nativeStart(JNIEnv *env, jclass clazz,
                                                  jint fd, jint width, jint height, jint fps) {
@@ -77,44 +122,30 @@ Java_com_linuxsuren_tvuvc_UvcCapture_nativeStart(JNIEnv *env, jclass clazz,
         g_captureClass = (*env)->NewGlobalRef(env, local);
         (*env)->DeleteLocalRef(env, local);
     }
-    uvc_error_t rc = uvc_init(&g_ctx, NULL);
-    if (rc != UVC_SUCCESS) {
-        LOGE("uvc_init failed: %d", rc);
+    if (uvc_init(&g_ctx, NULL) != UVC_SUCCESS) {
+        LOGE("uvc_init failed");
         g_ctx = NULL;
         return JNI_FALSE;
     }
-    rc = uvc_wrap(fd, g_ctx, &g_devh);
+    uvc_error_t rc = open_and_stream(fd, width, height, fps);
     if (rc != UVC_SUCCESS) {
-        LOGE("uvc_wrap(fd=%d) failed: %d", fd, rc);
-        uvc_exit(g_ctx);
-        g_ctx = NULL;
-        return JNI_FALSE;
+        /* 自愈：进程异常退出后摄像头可能残留占用，复位 USB 口后重试一次 */
+        LOGI("first attempt failed (%d), resetting USB device and retrying", rc);
+        close_all();
+        if (ioctl(fd, USBDEVFS_RESET) != 0) {
+            LOGE("USBDEVFS_RESET failed");
+        }
+        usleep(500 * 1000);
+        if (uvc_init(&g_ctx, NULL) != UVC_SUCCESS) {
+            g_ctx = NULL;
+            return JNI_FALSE;
+        }
+        rc = open_and_stream(fd, width, height, fps);
+        if (rc != UVC_SUCCESS) {
+            close_all();
+            return JNI_FALSE;
+        }
     }
-    LOGI("uvc_wrap ok, negotiating MJPEG %dx%d@%d", width, height, fps);
-
-    uvc_stream_ctrl_t ctrl;
-    rc = uvc_get_stream_ctrl_format_size(g_devh, &ctrl, UVC_FRAME_FORMAT_MJPEG,
-                                         width, height, fps);
-    if (rc != UVC_SUCCESS) {
-        LOGE("negotiate format failed: %d", rc);
-        uvc_close(g_devh);
-        g_devh = NULL;
-        uvc_exit(g_ctx);
-        g_ctx = NULL;
-        return JNI_FALSE;
-    }
-    g_streaming = 1;
-    rc = uvc_start_streaming(g_devh, &ctrl, frame_cb, NULL, 0);
-    if (rc != UVC_SUCCESS) {
-        LOGE("uvc_start_streaming failed: %d", rc);
-        g_streaming = 0;
-        uvc_close(g_devh);
-        g_devh = NULL;
-        uvc_exit(g_ctx);
-        g_ctx = NULL;
-        return JNI_FALSE;
-    }
-    LOGI("streaming started");
     return JNI_TRUE;
 }
 
