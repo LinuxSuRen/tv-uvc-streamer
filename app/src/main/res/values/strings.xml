@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">tv-uvc-streamer</string>
-    <string name="running_notification">采集中：%1$s</string>
 </resources>

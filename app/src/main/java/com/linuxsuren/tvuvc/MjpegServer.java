@@ -109,11 +109,10 @@ public final class MjpegServer {
     /** 供自愈任务调用：服务未运行时直接拉起采集服务。 */
     public static void ensureRunning(Context context) {
         if (serverSocket == null) {
-            Intent intent = new Intent(context, StreamService.class);
             try {
-                context.startService(intent);
+                StreamService.start(context);
             } catch (IllegalStateException ignored) {
-                // Android 8+ 后台启动限制；本项目目标 Android 6 不会走到
+                // 极端后台限制场景；下个周期会重试
             }
         }
     }

@@ -65,7 +65,7 @@ public class MainActivity extends Activity {
 
     private void startStreamService() {
         KeepAliveJob.schedule(this);
-        startService(new Intent(this, StreamService.class));
+        StreamService.start(this);
         statusView.setText("已转后台服务\nRTSP " + RtspServer.url()
                 + "\nMJPEG " + MjpegServer.url() + "stream");
         finish();

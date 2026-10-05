@@ -91,6 +91,11 @@ public class StreamService extends Service {
         return START_STICKY;
     }
 
+    /** 统一启动入口：所有机型走纯后台服务（targetSdk 23 豁免 API 26+ 后台限制） */
+    static void start(Context context) {
+        context.startService(new Intent(context, StreamService.class));
+    }
+
     private void acquireLocks() {
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tvuvc:stream");
