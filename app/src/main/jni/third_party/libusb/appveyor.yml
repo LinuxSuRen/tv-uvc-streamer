@@ -1,0 +1,53 @@
+version: 1.0.{build}
+image:
+  - Visual Studio 2017
+  - Visual Studio 2022
+platform:
+  - Win32
+  - x64
+configuration:
+  - Debug
+  - Release
+matrix:
+  exclude:
+    # GitHub Actions already checks these v143 configurations. Keep only the
+    # AppVeyor Release jobs whose artifacts are used to assemble releases.
+    - image: Visual Studio 2022
+      platform: Win32
+      configuration: Debug
+    - image: Visual Studio 2022
+      platform: x64
+      configuration: Debug
+environment:
+  toolset: UNK
+clone_depth: 1
+skip_branch_with_pr: true
+build:
+  parallel: true
+for:
+  -
+    matrix:
+      only:
+        - image: Visual Studio 2017
+    environment:
+      toolset: v141
+    build:
+      project: msvc\libusb.sln
+
+  -
+    matrix:
+      only:
+        - image: Visual Studio 2022
+          configuration: Release
+    environment:
+      toolset: v143
+    build:
+      project: msvc\libusb.sln
+
+after_build:
+  - cmd: ECHO This was built by %APPVEYOR_BUILD_WORKER_IMAGE% from %APPVEYOR_REPO_NAME% commit %APPVEYOR_REPO_COMMIT% > README-build.txt
+  - cmd: ECHO > tag_%APPVEYOR_REPO_TAG_NAME%_commit_%APPVEYOR_REPO_COMMIT%
+  - cmd: 7z a "libusb-build_%APPVEYOR_BUILD_WORKER_IMAGE%_%PLATFORM%_%CONFIGURATION%.7z" tag_* README-build.txt build\%TOOLSET%\%PLATFORM%\%CONFIGURATION%\dll build\%TOOLSET%\%PLATFORM%\%CONFIGURATION%\lib build\%TOOLSET%\%PLATFORM%\%CONFIGURATION%\*.exe
+
+artifacts:
+  - path: "libusb-build_%APPVEYOR_BUILD_WORKER_IMAGE%_%PLATFORM%_%CONFIGURATION%.7z"

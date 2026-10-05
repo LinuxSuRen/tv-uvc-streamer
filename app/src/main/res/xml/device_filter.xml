@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 匹配所有 UVC 视频类设备：class 14 (0x0E) / subclass 1 (Video Control) -->
+    <usb-device class="14" subclass="1" />
+</resources>

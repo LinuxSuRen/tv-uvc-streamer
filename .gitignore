@@ -1,0 +1,17 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# 原生构建产物
+.cxx/
+*.o
+*.a
+
+# 系统文件
+.DS_Store
