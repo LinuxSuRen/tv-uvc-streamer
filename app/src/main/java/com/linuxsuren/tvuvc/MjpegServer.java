@@ -12,32 +12,38 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 极简 MJPEG HTTP 服务。
+ * 极简 MJPEG HTTP 服务（多摄像头）。
  * <p>
- * 端点：
+ * 端点（cam 参数缺省为 0 号摄像头，单摄设备用法不变）：
  * <ul>
- *   <li>/             状态页</li>
- *   <li>/snapshot.jpg 最新单帧</li>
- *   <li>/stream       multipart/x-mixed-replace MJPEG 流</li>
+ *   <li>/             状态页（列出全部摄像头与入口）</li>
+ *   <li>/snapshot.jpg?cam=N 最新单帧</li>
+ *   <li>/stream?cam=N       multipart/x-mixed-replace MJPEG 流</li>
  * </ul>
  */
 public final class MjpegServer {
 
-    /** 帧订阅者（RTSP 等其他服务消费同一路帧流） */
+    /** 帧订阅者（RTSP 等其他服务消费同一路帧流，含摄像头编号） */
     public interface FrameListener {
-        void onFrame(byte[] frame, long frameIndex);
+        void onFrame(byte[] frame, int camera, long frameIndex);
     }
 
     private static final List<FrameListener> LISTENERS = new CopyOnWriteArrayList<>();
 
     public static void addListener(FrameListener listener) {
-        LISTENERS.add(listener);
+        // 幂等：服务每次启动都会注册 RTSP 广播监听器，静态列表跨重启存活，
+        // 重复注册会导致每帧被多次推流（RTP 序列错乱、流量翻倍）
+        if (!LISTENERS.contains(listener)) {
+            LISTENERS.add(listener);
+        }
     }
 
     public static void removeListener(FrameListener listener) {
@@ -47,24 +53,53 @@ public final class MjpegServer {
     public static final int PORT = 8090;
     private static final String BOUNDARY = "tvuvcframe";
 
-    private static volatile byte[] latest;
+    /** 每路摄像头的最新帧、名称与帧计数；cam 0 兼容单摄/UVC 场景 */
+    private static final Map<Integer, byte[]> LATEST = new HashMap<>();
+    private static final Map<Integer, String> LABELS = new HashMap<>();
+    private static final Map<Integer, Long> COUNTS = new HashMap<>();
     private static final Object LOCK = new Object();
-    private static final AtomicLong FRAME_COUNT = new AtomicLong();
+    private static long totalFrames;
+    private static long lastIndex;
     private static ServerSocket serverSocket;
     private static Thread acceptThread;
 
     private MjpegServer() {
     }
 
+    /** 采集层注册摄像头（会话建立后调用），供状态页与 ONVIF 枚举 */
+    public static void registerCamera(int camera, String label) {
+        synchronized (LOCK) {
+            LABELS.put(camera, label == null ? ("camera " + camera) : label);
+        }
+    }
+
+    /** 相机关闭（切换/停止）时反注册：ONVIF 只应广播真实在推流的相机，陈旧帧一并清理 */
+    public static void unregisterCamera(int camera) {
+        synchronized (LOCK) {
+            LABELS.remove(camera);
+            LATEST.remove(camera);
+            COUNTS.remove(camera);
+        }
+    }
+
+    /** 当前在推流的摄像头（编号 → 名称），快照拷贝 */
+    public static Map<Integer, String> cameras() {
+        synchronized (LOCK) {
+            return new HashMap<>(LABELS);
+        }
+    }
+
     public static synchronized void start() throws IOException {
         if (acceptThread != null && acceptThread.isAlive()) {
             return;
         }
-        serverSocket = new ServerSocket(PORT);
+        // accept 线程持局部引用：stop() 将静态字段置 null 时不会读到半空状态（实测 NPE 崩溃）
+        final ServerSocket socket = new ServerSocket(PORT);
+        serverSocket = socket;
         acceptThread = new Thread(() -> {
-            while (!serverSocket.isClosed()) {
+            while (!socket.isClosed()) {
                 try {
-                    Socket client = serverSocket.accept();
+                    Socket client = socket.accept();
                     Thread t = new Thread(() -> serve(client));
                     t.setDaemon(true);
                     t.start();
@@ -87,23 +122,35 @@ public final class MjpegServer {
         }
     }
 
-    /** 采集层发布一帧。 */
+    /** 采集层发布一帧（兼容入口：0 号摄像头） */
     public static void publish(byte[] frame) {
+        publish(frame, 0);
+    }
+
+    /** 采集层发布一帧（指定摄像头编号） */
+    public static void publish(byte[] frame, int camera) {
         if (frame == null || frame.length < 2) {
             return;
         }
-        long index = FRAME_COUNT.incrementAndGet();
+        long index;
         synchronized (LOCK) {
-            latest = frame;
+            index = ++lastIndex;
+            LATEST.put(camera, frame);
+            Long count = COUNTS.get(camera);
+            COUNTS.put(camera, count == null ? 1L : count + 1);
+            totalFrames++;
             LOCK.notifyAll();
         }
         for (FrameListener l : LISTENERS) {
-            l.onFrame(frame, index);
+            l.onFrame(frame, camera, index);
         }
     }
 
+    /** 全部摄像头累计帧数（界面展示用） */
     public static long frameCount() {
-        return FRAME_COUNT.get();
+        synchronized (LOCK) {
+            return totalFrames;
+        }
     }
 
     /** 供自愈任务调用：服务未运行时直接拉起采集服务。 */
@@ -141,11 +188,12 @@ public final class MjpegServer {
                 client.close();
                 return;
             }
+            int camera = cameraOf(path);
             OutputStream out = client.getOutputStream();
             if (path.startsWith("/snapshot.jpg")) {
-                writeSnapshot(out);
+                writeSnapshot(out, camera);
             } else if (path.startsWith("/stream")) {
-                writeStream(out);
+                writeStream(out, camera);
             } else {
                 writeStatusPage(out);
             }
@@ -157,6 +205,27 @@ public final class MjpegServer {
             } catch (IOException ignored) {
             }
         }
+    }
+
+    /** 从 "/snapshot.jpg?cam=1" 之类路径解析摄像头编号（缺省 0） */
+    static int cameraOf(String path) {
+        if (path == null) {
+            return 0;
+        }
+        int q = path.indexOf('?');
+        if (q < 0) {
+            return 0;
+        }
+        for (String kv : path.substring(q + 1).split("&")) {
+            if (kv.startsWith("cam=")) {
+                try {
+                    return Integer.parseInt(kv.substring(4).trim());
+                } catch (NumberFormatException ignored) {
+                    return 0;
+                }
+            }
+        }
+        return 0;
     }
 
     private static String readRequestPath(InputStream in) throws IOException {
@@ -181,21 +250,21 @@ public final class MjpegServer {
         return "/";
     }
 
-    private static byte[] latestFrame() throws IOException {
+    private static byte[] latestFrame(int camera) throws IOException {
         synchronized (LOCK) {
-            if (latest == null) {
+            if (!LATEST.containsKey(camera)) {
                 try {
                     LOCK.wait(5000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
             }
-            return latest;
+            return LATEST.get(camera);
         }
     }
 
-    private static void writeSnapshot(OutputStream out) throws IOException {
-        byte[] frame = latestFrame();
+    private static void writeSnapshot(OutputStream out, int camera) throws IOException {
+        byte[] frame = latestFrame(camera);
         if (frame == null) {
             out.write(("HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
             return;
@@ -205,11 +274,11 @@ public final class MjpegServer {
         out.write(frame);
     }
 
-    private static void writeStream(OutputStream out) throws IOException {
+    private static void writeStream(OutputStream out, int camera) throws IOException {
         out.write(("HTTP/1.0 200 OK\r\nContent-Type: multipart/x-mixed-replace;boundary="
                 + BOUNDARY + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
         while (!Thread.currentThread().isInterrupted()) {
-            byte[] frame = latestFrame();
+            byte[] frame = latestFrame(camera);
             if (frame == null) {
                 continue;
             }
@@ -226,20 +295,33 @@ public final class MjpegServer {
 
     private static void writeStatusPage(OutputStream out) throws IOException {
         String ip = lanAddress();
-        long frames = FRAME_COUNT.get();
-        String html = "<html><head><meta charset='utf-8'><title>tv-uvc-streamer</title></head>"
-                + "<body style='font-family:monospace;background:#111;color:#eee;padding:2em'>"
-                + "<h2>tv-uvc-streamer</h2>"
-                + "<p>frames: " + frames + "</p>"
-                + "<p><a style='color:#8cf' href='http://" + ip + ":" + PORT + "/stream'>/stream</a> MJPEG 流</p>"
-                + "<p><a style='color:#8cf' href='http://" + ip + ":" + PORT + "/snapshot.jpg'>/snapshot.jpg</a> 单帧快照</p>"
-                + "<p><img src='/snapshot.jpg' width='640'></p>"
-                + "</body></html>";
-        byte[] body = html.getBytes(StandardCharsets.UTF_8);
+        Map<Integer, String> cams = cameras();
+        StringBuilder body = new StringBuilder();
+        body.append("<html><head><meta charset='utf-8'><title>tv-uvc-streamer</title></head>")
+                .append("<body style='font-family:monospace;background:#111;color:#eee;padding:2em'>")
+                .append("<h2>tv-uvc-streamer</h2>")
+                .append("<p>device: ").append(android.os.Build.MANUFACTURER).append(' ')
+                .append(android.os.Build.MODEL)
+                .append(" (Android ").append(android.os.Build.VERSION.RELEASE).append(")</p>");
+        if (cams.isEmpty()) {
+            body.append("<p>frames: ").append(totalFrames).append("</p>");
+        }
+        for (Map.Entry<Integer, String> e : cams.entrySet()) {
+            int cam = e.getKey();
+            String suffix = cam == 0 ? "" : "?cam=" + cam;
+            body.append("<h3>").append(e.getValue()).append(" (camera ").append(cam).append(")</h3>")
+                    .append("<p><a style='color:#8cf' href='http://").append(ip).append(':').append(PORT)
+                    .append("/stream").append(suffix).append("'>/stream").append(suffix).append("</a>")
+                    .append(" · <a style='color:#8cf' href='http://").append(ip).append(':').append(PORT)
+                    .append("/snapshot.jpg").append(suffix).append("'>/snapshot.jpg").append(suffix).append("</a>")
+                    .append("</p><p><img src='/snapshot.jpg").append(suffix).append("' width='480'></p>");
+        }
+        body.append("</body></html>");
+        byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
         String header = "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "
-                + body.length + "\r\n\r\n";
+                + bytes.length + "\r\n\r\n";
         out.write(header.getBytes(StandardCharsets.US_ASCII));
-        out.write(body);
+        out.write(bytes);
     }
 
     static String url() {

@@ -40,11 +40,13 @@ public final class RtspServer {
         if (acceptThread != null && acceptThread.isAlive()) {
             return;
         }
-        serverSocket = new ServerSocket(PORT);
+        // accept 线程持局部引用：stop() 将静态字段置 null 时不会读到半空状态（实测 NPE 崩溃）
+        final ServerSocket socket = new ServerSocket(PORT);
+        serverSocket = socket;
         acceptThread = new Thread(() -> {
-            while (!serverSocket.isClosed()) {
+            while (!socket.isClosed()) {
                 try {
-                    Socket client = serverSocket.accept();
+                    Socket client = socket.accept();
                     Thread t = new Thread(() -> serve(client));
                     t.setDaemon(true);
                     t.start();
@@ -91,52 +93,74 @@ public final class RtspServer {
                 }
                 String[] parts = line.split(" ");
                 String method = parts[0];
-                // 读掉该请求剩余头部
+                // /cam（兼容 cam0）与 /camN 对应第 N 路摄像头
+                int camera = cameraOfUrl(parts.length > 1 ? parts[1] : "");
+                // 读掉该请求剩余头部（CSeq 必须原样回显，ffmpeg 等客户端校验不匹配会断连）
+                String cseq = null;
                 String transport = null;
                 String h;
                 while ((h = in.readLine()) != null && !h.isEmpty()) {
-                    if (h.toLowerCase(Locale.US).startsWith("transport:")) {
+                    String lower = h.toLowerCase(Locale.US);
+                    if (lower.startsWith("cseq:")) {
+                        cseq = h.substring(h.indexOf(':') + 1).trim();
+                    } else if (lower.startsWith("transport:")) {
                         transport = h.substring(h.indexOf(':') + 1).trim();
                     }
                 }
+                if (cseq == null) {
+                    cseq = "0";
+                }
                 switch (method) {
                     case "OPTIONS":
-                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseqOf(line)
+                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                 + "\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n");
                         break;
                     case "DESCRIBE":
-                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseqOf(line)
+                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                 + "\r\nContent-Type: application/sdp\r\nContent-Length: "
                                 + sdp().length() + "\r\n\r\n" + sdp());
                         break;
                     case "SETUP":
                         session = Integer.toHexString(new Random().nextInt(0x7FFFFFFF));
-                        client = new Client(socket.getInetAddress(), transport);
+                        client = new Client(socket.getInetAddress(), transport, out, camera);
                         CLIENTS.add(client);
-                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseqOf(line)
-                                + "\r\nSession: " + session
-                                + "\r\nTransport: " + transport + ";server_port=" + client.rtpPort + "-" + (client.rtpPort + 1)
-                                + "\r\n\r\n");
+                        synchronized (client.lock) {
+                            write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
+                                    + "\r\nSession: " + session
+                                    + "\r\nTransport: " + client.transportReply
+                                    + "\r\n\r\n");
+                        }
                         break;
                     case "PLAY":
                         if (client != null) {
                             client.playing = true;
+                            if (client.tcp != null) {
+                                // interleaved 客户端长连接上可能长时间无请求，关掉读超时避免误杀
+                                socket.setSoTimeout(0);
+                            }
+                            synchronized (client.lock) {
+                                write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
+                                        + "\r\nSession: " + session
+                                        + "\r\nRTP-Info: url=" + url() + ";seq=0;rtptime=0"
+                                        + "\r\nRange: npt=0-\r\n\r\n");
+                            }
+                        } else {
+                            write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
+                                    + "\r\nSession: " + session
+                                    + "\r\nRTP-Info: url=" + url() + ";seq=0;rtptime=0"
+                                    + "\r\nRange: npt=0-\r\n\r\n");
                         }
-                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseqOf(line)
-                                + "\r\nSession: " + session
-                                + "\r\nRTP-Info: url=" + url() + ";seq=0;rtptime=0"
-                                + "\r\nRange: npt=0-\r\n\r\n");
                         break;
                     case "TEARDOWN":
                         if (client != null) {
                             CLIENTS.remove(client);
                             client.close();
                         }
-                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseqOf(line)
+                        write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                 + "\r\nSession: " + session + "\r\n\r\n");
                         return;
                     default:
-                        write(out, "RTSP/1.0 501 Not Implemented\r\nCSeq: " + cseqOf(line) + "\r\n\r\n");
+                        write(out, "RTSP/1.0 501 Not Implemented\r\nCSeq: " + cseq + "\r\n\r\n");
                 }
             }
         } catch (SocketTimeoutException ignored) {
@@ -147,10 +171,6 @@ public final class RtspServer {
             } catch (IOException ignored) {
             }
         }
-    }
-
-    private static String cseqOf(String requestLine) {
-        return String.valueOf(System.nanoTime() & 0xFFFF); // 极简：客户端基本不校验顺序
     }
 
     private static String sdp() {
@@ -169,11 +189,35 @@ public final class RtspServer {
         out.flush();
     }
 
+    /** 从请求行 URL（rtsp://host:port/cam1 或 /cam1）解析摄像头编号，未识别为 0 */
+    static int cameraOfUrl(String url) {
+        if (url == null || url.isEmpty()) {
+            return 0;
+        }
+        int pathStart = url.indexOf("://");
+        String path = pathStart >= 0 ? url.substring(pathStart + 3) : url;
+        int slash = path.indexOf('/');
+        path = slash >= 0 ? path.substring(slash + 1) : "";
+        // 去掉查询串
+        int q = path.indexOf('?');
+        if (q >= 0) {
+            path = path.substring(0, q);
+        }
+        if (path.startsWith("cam") && path.length() > 3) {
+            try {
+                return Integer.parseInt(path.substring(3));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0; // /cam 及其他路径兼容 0 号摄像头
+    }
+
     // ---------------- RTP 发送 ----------------
 
-    private static void broadcastFrame(byte[] frame, long frameIndex) {
+    /** 只向订阅了对应摄像头的客户端分发 */
+    private static void broadcastFrame(byte[] frame, int camera, long frameIndex) {
         for (Client c : CLIENTS) {
-            if (c.playing) {
+            if (c.camera == camera && c.playing) {
                 c.sendFrame(frame, frameIndex);
             }
         }
@@ -181,20 +225,55 @@ public final class RtspServer {
 
     private static final class Client {
         final InetAddress address;
+        final int camera; // 订阅的摄像头编号
         final int rtpPort;
         final int rtcpPort;
-        final DatagramSocket socket;
+        final DatagramSocket socket;  // UDP 模式使用；interleaved 模式为 null
+        final OutputStream tcp;       // interleaved 模式：RTSP 同连接回传 RTP；UDP 模式为 null
+        final int interleave;         // interleaved 通道号
+        final String transportReply;  // SETUP 应答的 Transport 头
+        final Object lock = new Object(); // RTSP 应答与 RTP 数据同 socket 写出，需互斥
         final int ssrc;
         volatile boolean playing;
         int sequence = 0;
 
-        Client(InetAddress address, String transport) throws IOException {
+        Client(InetAddress address, String transport, OutputStream tcpSink, int cameraIndex) throws IOException {
             this.address = address;
-            int[] ports = parseClientPorts(transport);
-            this.rtpPort = ports[0];
-            this.rtcpPort = ports[1];
-            this.socket = new DatagramSocket();
+            this.camera = cameraIndex;
             this.ssrc = new Random().nextInt();
+            Integer channel = parseInterleaved(transport);
+            if (channel != null && tcpSink != null) {
+                // RTP over TCP（interleaved）：数据经 "$" 帧走 RTSP 连接，地址/端口无意义
+                this.tcp = tcpSink;
+                this.interleave = channel;
+                this.socket = null;
+                this.rtpPort = 0;
+                this.rtcpPort = 0;
+                this.transportReply = transport;
+            } else {
+                this.tcp = null;
+                this.interleave = -1;
+                int[] ports = parseClientPorts(transport);
+                this.rtpPort = ports[0];
+                this.rtcpPort = ports[1];
+                this.socket = new DatagramSocket();
+                this.transportReply = transport + ";server_port=" + rtpPort + "-" + (rtpPort + 1);
+            }
+        }
+
+        private static Integer parseInterleaved(String transport) {
+            if (transport == null) {
+                return null;
+            }
+            int i = transport.indexOf("interleaved=");
+            if (i < 0) {
+                return null;
+            }
+            try {
+                return Integer.parseInt(transport.substring(i + "interleaved=".length()).split("[;-]")[0].trim());
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
         }
 
         private static int[] parseClientPorts(String transport) {
@@ -223,7 +302,13 @@ public final class RtspServer {
             if (p == null) {
                 return;
             }
-            final int type = 1; // 4:2:0（Y=2x2），对应 ffmpeg rtpdec_jpeg 的 hsample/vsample=(2,2)
+            // RFC 2435 type：0 = 4:2:2，1 = 4:2:0（由 SOF 首分量采样因子决定）
+            // 注：type 64+（重启标记）ffmpeg rtpdec_jpeg 不支持（Unimplemented），直接丢弃；
+            // 发布层已对含 DRI 的帧重编码归一化，正常不会走到这里
+            if (p.restartInterval > 0) {
+                return;
+            }
+            int type = p.sampling == 0x21 ? 0 : 1;
             int timestamp = (int) ((frameIndex * CLOCK / 25) & 0xFFFFFFFFL);
             // 首片额外携带 4 字节量化头 + 量化表；其余分片仅 20 字节开销
             int maxChunk = MAX_PACKET - 12 - 8;
@@ -260,10 +345,10 @@ public final class RtspServer {
                     pkt[13] = (byte) ((off >> 16) & 0xFF);         // fragment offset 高
                     pkt[14] = (byte) ((off >> 8) & 0xFF);          // fragment offset 中
                     pkt[15] = (byte) (off & 0xFF);                 // fragment offset 低
-                    pkt[16] = (byte) type;                         // 1 = 4:2:0
+                    pkt[16] = (byte) type;                         // 0=4:2:2，1=4:2:0
                     pkt[17] = (byte) 255;                          // 质量 255 = 携带量化表
-                    pkt[18] = (byte) (1280 / 8);                   // 宽/8
-                    pkt[19] = (byte) (720 / 8);                    // 高/8
+                    pkt[18] = (byte) (p.width / 8);                // 宽/8（来自 SOF）
+                    pkt[19] = (byte) (p.height / 8);               // 高/8
                     int pos = 20;
                     if (first) {
                         // 量化表头：MBZ、精度（8bit=0）、表长度
@@ -275,7 +360,21 @@ public final class RtspServer {
                         pos = 24 + p.tables.length;
                     }
                     System.arraycopy(jpeg, p.scanStart + off, pkt, pos, len);
-                    socket.send(new DatagramPacket(pkt, pkt.length, address, rtpPort));
+                    if (tcp != null) {
+                        // interleaved：4 字节帧头 '$' + 通道 + 长度，走 RTSP 连接
+                        byte[] framed = new byte[4 + pkt.length];
+                        framed[0] = '$';
+                        framed[1] = (byte) interleave;
+                        framed[2] = (byte) ((pkt.length >> 8) & 0xFF);
+                        framed[3] = (byte) (pkt.length & 0xFF);
+                        System.arraycopy(pkt, 0, framed, 4, pkt.length);
+                        synchronized (lock) {
+                            tcp.write(framed);
+                            tcp.flush();
+                        }
+                    } else {
+                        socket.send(new DatagramPacket(pkt, pkt.length, address, rtpPort));
+                    }
                     sequence = (sequence + 1) & 0xFFFF;
                     off += len;
                 }
@@ -290,30 +389,44 @@ public final class RtspServer {
             if (socket != null && !socket.isClosed()) {
                 socket.close();
             }
+            // interleaved 模式的 socket 归属 RTSP 会话线程，不在此关闭
         }
     }
 
-    /** JPEG 帧解析结果：量化表（标准 JPEG 格式，含表 ID 字节）与扫描数据区间 */
+    /** JPEG 帧解析结果：量化表、扫描数据区间、SOF 尺寸、Y 采样因子、重启间隔 */
     private static final class ParsedJpeg {
         final byte[] tables;
         final int scanStart;
         final int scanEnd;
+        final int width;
+        final int height;
+        final int sampling; // 高 4 位水平采样、低 4 位垂直采样
+        final int restartInterval; // DRI 重启间隔（MCU 数），0 = 无重启标记
 
-        ParsedJpeg(byte[] tables, int scanStart, int scanEnd) {
+        ParsedJpeg(byte[] tables, int scanStart, int scanEnd, int width, int height, int sampling, int restartInterval) {
             this.tables = tables;
             this.scanStart = scanStart;
             this.scanEnd = scanEnd;
+            this.width = width;
+            this.height = height;
+            this.sampling = sampling;
+            this.restartInterval = restartInterval;
         }
     }
 
     /**
      * 解析 JPEG：收集全部 DQT 段（FFDB）并去掉每张表 1 字节的表 ID（ffmpeg 要求
-     * 量化表为 64 字节裸值的连续序列，两张表即 128 字节）；定位 SOS（FFDA）段之后
-     * 的熵编码扫描数据起点；结尾去掉 EOI（FFD9）。MJPEG 基线帧为单扫描。
+     * 量化表为 64 字节裸值的连续序列，两张表即 128 字节）；SOF 段（FFC0/C1/C2）
+     * 提取真实宽高与采样因子（决定 RFC 2435 的 type 与 w/8、h/8 字段，禁止写死）；
+     * 定位 SOS（FFDA）段之后的熵编码扫描数据起点；结尾去掉 EOI（FFD9）。
      */
     private static ParsedJpeg parseJpeg(byte[] j) {
         java.io.ByteArrayOutputStream rawTables = new java.io.ByteArrayOutputStream();
         int scanStart = -1;
+        int width = 0;
+        int height = 0;
+        int sampling = 0x22; // 默认 4:2:0
+        int restartInterval = 0;
         int i = 2; // 跳过 SOI
         while (i + 4 <= j.length) {
             if (j[i] != (byte) 0xFF) {
@@ -339,20 +452,32 @@ public final class RtspServer {
                     rawTables.write(j, t + 1, 64); // 跳过表 ID 字节
                     t += 65;
                 }
+            } else if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) { // SOF
+                // FF C0 | len | precision | height(2) | width(2) | ncomp | [id sampling qtbl]*
+                if (i + 13 <= j.length && segLen >= 8) {
+                    height = ((j[i + 5] & 0xFF) << 8) | (j[i + 6] & 0xFF);
+                    width = ((j[i + 7] & 0xFF) << 8) | (j[i + 8] & 0xFF);
+                    sampling = j[i + 11] & 0xFF; // 首分量（Y）
+                }
+            } else if (marker == 0xDD) { // DRI：重启间隔（MCU 数），扫描数据内含 RSTn 标记
+                if (segLen >= 4 && i + 6 <= j.length) {
+                    restartInterval = ((j[i + 4] & 0xFF) << 8) | (j[i + 5] & 0xFF);
+                }
             } else if (marker == 0xDA) { // SOS：扫描数据起点 = 段尾
                 scanStart = i + 2 + segLen;
                 break;
             }
             i += 2 + segLen;
         }
-        if (scanStart < 0 || rawTables.size() == 0) {
-            return null;
+        if (scanStart < 0 || rawTables.size() == 0 || width <= 0 || height <= 0
+                || width / 8 > 255 || height / 8 > 255) {
+            return null; // 无 SOF/超限尺寸无法生成合法 RTP JPEG 头
         }
         int scanEnd = j.length;
         if (scanEnd - scanStart >= 2
                 && j[scanEnd - 2] == (byte) 0xFF && j[scanEnd - 1] == (byte) 0xD9) {
             scanEnd -= 2;
         }
-        return new ParsedJpeg(rawTables.toByteArray(), scanStart, scanEnd);
+        return new ParsedJpeg(rawTables.toByteArray(), scanStart, scanEnd, width, height, sampling, restartInterval);
     }
 }

@@ -1,5 +1,8 @@
 package com.linuxsuren.tvuvc;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -11,10 +14,12 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 
 import java.util.HashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 采集与流媒体服务。
@@ -32,8 +37,12 @@ public class StreamService extends Service {
     private static final int WANT_WIDTH = 1280;
     private static final int WANT_HEIGHT = 720;
     private static final int WANT_FPS = 25;
+    private static final String CHANNEL_ID = "tvuvc-stream";
+    private static final int NOTIFICATION_ID = 1;
 
     private boolean running;
+    /** 启动流水线进行中标志：相机打开/回退是异步的，防止并发重复启动（KeepAliveJob 与界面同时拉起时实测会并发打开两次相机/争抢 UVC 上下文） */
+    private final AtomicBoolean starting = new AtomicBoolean();
     private UsbDeviceConnection connection;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
@@ -41,7 +50,13 @@ public class StreamService extends Service {
     private final BroadcastReceiver detachReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction()) && running) {
+            if (!UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction()) || !running) {
+                return;
+            }
+            // 只有正在采集的摄像头（视频类设备）被拔出才停止；
+            // 部分整机将 WiFi 等模块内挂在 USB 总线上，其重枚举广播不应中断推流
+            UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+            if (device == null || hasVideoInterface(device)) {
                 stopSelf();
             }
         }
@@ -55,30 +70,78 @@ public class StreamService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        promoteToForeground();
         KeepAliveJob.schedule(this);
-        if (running) {
+        if (running || !starting.compareAndSet(false, true)) {
             return START_STICKY;
+        }
+        // 优先内置摄像头（Camera2 系统路径，避开定制设备上的原生层异常）；
+        // 无内置、未授权或启动失败时回退 USB UVC（电视场景）。
+        // openCamera 的 connect binder 调用可能被卡死的相机 HAL 无限期阻塞
+        // （OPPO 实测 ANR），因此整个启动尝试放工作线程，绝不占主线程
+        final boolean builtinAuthorized = BuiltInCamera.hasCamera(this)
+                && checkSelfPermission(android.Manifest.permission.CAMERA)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if (builtinAuthorized) {
+            new Thread(() -> {
+                boolean accepted = BuiltInCamera.start(this, WANT_WIDTH, WANT_HEIGHT,
+                        () -> {
+                            try {
+                                MjpegServer.start();
+                                RtspServer.start();
+                                OnvifServer.start(StreamService.this);
+                                running = true;
+                                starting.set(false);
+                                acquireLocks();
+                            } catch (Exception e) {
+                                android.util.Log.e("tv-uvc-streamer", "server start failed", e);
+                                stopSelf();
+                            }
+                        },
+                        () -> startFromUsb());
+                if (!accepted) {
+                    if (!running) {
+                        startFromUsb();
+                    } else {
+                        starting.set(false);
+                    }
+                }
+            }, "builtin-cam-start").start();
+            return START_STICKY;
+        }
+        startFromUsb();
+        return START_STICKY;
+    }
+
+    private void startFromUsb() {
+        if (running) {
+            starting.set(false);
+            return;
         }
         UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
         UsbDevice camera = findCamera(usbManager);
         if (camera == null || !usbManager.hasPermission(camera)) {
+            starting.set(false);
             stopSelf();
-            return START_NOT_STICKY;
+            return;
         }
         connection = usbManager.openDevice(camera);
         if (connection == null) {
+            starting.set(false);
             stopSelf();
-            return START_NOT_STICKY;
+            return;
         }
         final int fd = connection.getFileDescriptor();
         new Thread(() -> {
             boolean ok = UvcCapture.nativeStart(fd, WANT_WIDTH, WANT_HEIGHT, WANT_FPS);
             if (ok) {
                 try {
+                    MjpegServer.registerCamera(0, "USB 摄像头");
                     MjpegServer.start();
                     RtspServer.start();
                     OnvifServer.start(StreamService.this);
                     running = true;
+                    starting.set(false);
                     acquireLocks();
                     return;
                 } catch (Exception e) {
@@ -86,14 +149,43 @@ public class StreamService extends Service {
                     UvcCapture.nativeStop();
                 }
             }
+            starting.set(false);
             stopSelf();
         }, "uvc-start").start();
-        return START_STICKY;
+    }
+
+    /**
+     * 升级为前台服务并挂常驻通知：Android 12 的「应用闲置」会在约 1 分钟后
+     * 强停纯后台 started Service（实测 "Stopping service due to app idle"），
+     * 前台服务豁免该机制；Android 6（电视场景）同样兼容，仅多一条状态通知。
+     */
+    private void promoteToForeground() {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= 26
+                && nm.getNotificationChannel(CHANNEL_ID) == null) {
+            nm.createNotificationChannel(new NotificationChannel(CHANNEL_ID,
+                    getString(R.string.foreground_channel), NotificationManager.IMPORTANCE_LOW));
+        }
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL_ID)
+                : new Notification.Builder(this);
+        builder.setSmallIcon(android.R.drawable.ic_menu_camera)
+                .setContentTitle(getString(R.string.foreground_title))
+                .setContentText(MjpegServer.url() + "stream")
+                .setOngoing(true);
+        startForeground(NOTIFICATION_ID, builder.build());
     }
 
     /** 统一启动入口：所有机型走纯后台服务（targetSdk 23 豁免 API 26+ 后台限制） */
     static void start(Context context) {
         context.startService(new Intent(context, StreamService.class));
+    }
+
+    /** 采集参数变更（如切换摄像头）后的重启：先停稳再拉起，避免 running 标志竞态 */
+    static void restart(Context context) {
+        context.stopService(new Intent(context, StreamService.class));
+        new android.os.Handler(android.os.Looper.getMainLooper())
+                .postDelayed(() -> start(context), 800);
     }
 
     private void acquireLocks() {
@@ -119,20 +211,29 @@ public class StreamService extends Service {
     static UsbDevice findCamera(UsbManager usbManager) {
         HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
         for (UsbDevice device : devices.values()) {
-            for (int i = 0; i < device.getInterfaceCount(); i++) {
-                UsbInterface iface = device.getInterface(i);
-                if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_VIDEO) {
-                    return device;
-                }
+            if (hasVideoInterface(device)) {
+                return device;
             }
         }
         return null;
+    }
+
+    private static boolean hasVideoInterface(UsbDevice device) {
+        for (int i = 0; i < device.getInterfaceCount(); i++) {
+            UsbInterface iface = device.getInterface(i);
+            if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_VIDEO) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
     public void onDestroy() {
         if (running) {
             running = false;
+            starting.set(false);
+            BuiltInCamera.stop();
             OnvifServer.stop();
             RtspServer.stop();
             MjpegServer.stop();

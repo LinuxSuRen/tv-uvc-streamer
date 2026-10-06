@@ -2,6 +2,8 @@ package com.linuxsuren.tvuvc;
 
 import android.content.Context;
 import android.net.wifi.WifiManager;
+import android.os.Build;
+import android.provider.Settings;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -13,7 +15,9 @@ import java.net.MulticastSocket;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -40,8 +44,40 @@ public final class OnvifServer {
     private static Thread discoveryThread;
     private static WifiManager.MulticastLock multicastLock;
     private static boolean running;
+    private static Context appContext; // 供 SOAP 应答读取设备信息
 
     private OnvifServer() {
+    }
+
+    /** 真实设备标识：厂商/机型/系统版本/序列号（受限时回退 ANDROID_ID），供 ONVIF 应答使用 */
+    private static String manufacturer() {
+        return Build.MANUFACTURER == null ? "unknown" : Build.MANUFACTURER;
+    }
+
+    private static String model() {
+        return Build.MODEL == null || Build.MODEL.isEmpty() ? Build.DEVICE : Build.MODEL;
+    }
+
+    private static String firmware() {
+        return "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")";
+    }
+
+    private static String serialNumber() {
+        try {
+            String serial = Build.getSerial();
+            if (serial != null && !serial.isEmpty() && !"unknown".equals(serial)) {
+                return serial;
+            }
+        } catch (Exception ignored) {
+            // API 26+ 普通应用无权读取，回退
+        }
+        if (appContext != null) {
+            String id = Settings.Secure.getString(appContext.getContentResolver(), Settings.Secure.ANDROID_ID);
+            if (id != null && !id.isEmpty()) {
+                return id;
+            }
+        }
+        return "unknown";
     }
 
     public static synchronized void start(Context context) throws IOException {
@@ -49,6 +85,7 @@ public final class OnvifServer {
             return;
         }
         running = true; // 必须先置位，再启动线程（accept 循环依赖此标志）
+        appContext = context.getApplicationContext();
         // 组播锁：WiFi 驱动默认过滤组播包，必须持有 MulticastLock 才能收到 Probe
         WifiManager wm = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wm != null) {
@@ -63,22 +100,32 @@ public final class OnvifServer {
 
     public static synchronized void stop() {
         running = false;
-        if (discoverySocket != null) {
-            sendBye();
-            discoverySocket.close();
-            discoverySocket = null;
+        final MulticastSocket discovery = discoverySocket;
+        final ServerSocket http = httpServer;
+        final WifiManager.MulticastLock lock = multicastLock;
+        discoverySocket = null;
+        httpServer = null;
+        multicastLock = null;
+        if (discovery == null) {
+            return;
         }
-        if (httpServer != null) {
-            try {
-                httpServer.close();
-            } catch (IOException ignored) {
+        // 组播发送是网络操作：主线程执行会抛 NetworkOnMainThreadException（Android 12 实测），
+        // 全部清理动作放到后台线程完成
+        Thread closer = new Thread(() -> {
+            sendBye(discovery);
+            discovery.close();
+            if (http != null) {
+                try {
+                    http.close();
+                } catch (IOException ignored) {
+                }
             }
-            httpServer = null;
-        }
-        if (multicastLock != null) {
-            multicastLock.release();
-            multicastLock = null;
-        }
+            if (lock != null) {
+                lock.release();
+            }
+        }, "onvif-stop");
+        closer.setDaemon(true);
+        closer.start();
     }
 
     // ---------------- WS-Discovery ----------------
@@ -116,9 +163,13 @@ public final class OnvifServer {
     }
 
     private static String scopes() {
+        // Scopes 是空格分隔的 token：设备名去空白；name 是客户端展示用的主标题，
+        // 带上宿主机型便于多设备区分（如 onvif-ai 发现列表）
+        String hardware = model().replaceAll("\\s+", "_");
+        String name = ("tv-uvc-streamer@" + model()).replaceAll("\\s+", "_");
         return "onvif://www.onvif.org/type/NetworkVideoTransmitter"
-                + " onvif://www.onvif.org/name/tvuvc"
-                + " onvif://www.onvif.org/hardware/MiTV4"
+                + " onvif://www.onvif.org/name/" + name
+                + " onvif://www.onvif.org/hardware/" + hardware
                 + " onvif://www.onvif.org/Profile/Streaming";
     }
 
@@ -159,8 +210,13 @@ public final class OnvifServer {
         sendMulticast(discoveryMessage("Hello", null));
     }
 
-    private static void sendBye() {
-        sendMulticast(discoveryMessage("Bye", null));
+    private static void sendBye(MulticastSocket socket) {
+        try {
+            byte[] data = discoveryMessage("Bye", null).getBytes(StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(data, data.length,
+                    InetAddress.getByName(DISCOVERY_GROUP), DISCOVERY_PORT));
+        } catch (IOException ignored) {
+        }
     }
 
     private static void sendMulticast(String msg) {
@@ -253,11 +309,11 @@ public final class OnvifServer {
         }
         if (request.contains("GetDeviceInformation")) {
             return soapBody("<td:GetDeviceInformationResponse>"
-                    + "<td:Manufacturer>LinuxSuRen</td:Manufacturer>"
-                    + "<td:Model>tv-uvc-streamer</td:Model>"
-                    + "<td:FirmwareVersion>0.1.0</td:FirmwareVersion>"
-                    + "<td:SerialNumber>MiTV4-ANSM0</td:SerialNumber>"
-                    + "<td:HardwareId>MiTV4</td:HardwareId>"
+                    + "<td:Manufacturer>" + manufacturer() + "</td:Manufacturer>"
+                    + "<td:Model>" + model() + "</td:Model>"
+                    + "<td:FirmwareVersion>" + firmware() + "</td:FirmwareVersion>"
+                    + "<td:SerialNumber>" + serialNumber() + "</td:SerialNumber>"
+                    + "<td:HardwareId>" + (Build.BOARD == null || Build.BOARD.isEmpty() ? model() : Build.BOARD) + "</td:HardwareId>"
                     + "</td:GetDeviceInformationResponse>");
         }
         if (request.contains("GetCapabilities")) {
@@ -282,35 +338,75 @@ public final class OnvifServer {
                     + "</td:GetServicesResponse>");
         }
         if (request.contains("GetProfiles")) {
-            return soapBody("<trt:GetProfilesResponse>"
-                    + "<trt:Profiles fixed=\"true\" token=\"profile_1\">"
-                    + "<tt:Name>main</tt:Name>"
-                    + "<tt:VideoSourceConfiguration token=\"vsc_1\">"
-                    + "<tt:Name>VideoSource_1</tt:Name><tt:SourceToken>src_1</tt:SourceToken>"
-                    + "<tt:Bounds x=\"0\" y=\"0\" width=\"1280\" height=\"720\"/>"
-                    + "</tt:VideoSourceConfiguration>"
-                    + "<tt:VideoEncoderConfiguration token=\"vec_1\">"
-                    + "<tt:Name>JPEG1280x720</tt:Name>"
-                    + "<tt:UseCount>1</tt:UseCount>"
-                    + "<tt:Encoding>JPEG</tt:Encoding>"
-                    + "<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"
-                    + "<tt:Quality>4</tt:Quality>"
-                    + "<tt:RateControl><tt:FrameRateLimit>25</tt:FrameRateLimit>"
-                    + "<tt:BitrateLimit>8192</tt:BitrateLimit></tt:RateControl>"
-                    + "</tt:VideoEncoderConfiguration>"
-                    + "</trt:Profiles>"
-                    + "</trt:GetProfilesResponse>");
+            // 多摄像头：每路一个 Profile（token=profile_{N+1}，N 为全局相机编号），
+            // Name 体现相机名（前置/后置/外接）；编号直接取注册表，避免位置错位
+            java.util.Map<Integer, String> cams = new java.util.TreeMap<>(MjpegServer.cameras());
+            if (cams.isEmpty()) {
+                // UVC USB 摄像头 / 相机未就绪场景：单 Profile
+                return soapBody(profileXml(1, "USB 摄像头"));
+            }
+            StringBuilder sb = new StringBuilder("<trt:GetProfilesResponse>");
+            for (Map.Entry<Integer, String> e : cams.entrySet()) {
+                sb.append(profileXml(e.getKey() + 1, e.getValue()));
+            }
+            return soapBody(sb.append("</trt:GetProfilesResponse>").toString());
         }
         if (request.contains("GetStreamUri")) {
+            int cam = cameraOfToken(extract(request, "ProfileToken>([^<]+)<"));
+            String path = cam == 0 ? "cam" : "cam" + cam;
             return soapBody("<trt:GetStreamUriResponse><trt:MediaUri>"
-                    + "<tt:Uri>rtsp://" + ip + ":" + RtspServer.PORT + "/cam</tt:Uri>"
+                    + "<tt:Uri>rtsp://" + ip + ":" + RtspServer.PORT + "/" + path + "</tt:Uri>"
                     + "<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>"
                     + "<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>"
                     + "<tt:Timeout>PT60S</tt:Timeout>"
                     + "</trt:MediaUri></trt:GetStreamUriResponse>");
         }
+        if (request.contains("GetSnapshotUri")) {
+            // 快照通道：HTTP 单帧 JPEG，供不支持 MJPEG-RTSP 的客户端降级轮询（如 onvif-ai）
+            int cam = cameraOfToken(extract(request, "ProfileToken>([^<]+)<"));
+            String suffix = cam == 0 ? "" : "?cam=" + cam;
+            return soapBody("<trt:GetSnapshotUriResponse><trt:MediaUri>"
+                    + "<tt:Uri>http://" + ip + ":" + MjpegServer.PORT + "/snapshot.jpg" + suffix + "</tt:Uri>"
+                    + "<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>"
+                    + "<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>"
+                    + "<tt:Timeout>PT60S</tt:Timeout>"
+                    + "</trt:MediaUri></trt:GetSnapshotUriResponse>");
+        }
         // 未知动作：返回空 SOAP（兼容部分客户端的探测序列）
         return soapBody("");
+    }
+
+    /** 单个 Profile 的 XML（n 从 1 起，label 为相机名：前置/后置/外接…） */
+    private static String profileXml(int n, String label) {
+        return "<trt:Profiles fixed=\"true\" token=\"profile_" + n + "\">"
+                + "<tt:Name>" + label + "</tt:Name>"
+                + "<tt:VideoSourceConfiguration token=\"vsc_" + n + "\">"
+                + "<tt:Name>VideoSource_" + n + "</tt:Name><tt:SourceToken>src_" + n + "</tt:SourceToken>"
+                + "<tt:Bounds x=\"0\" y=\"0\" width=\"1280\" height=\"720\"/>"
+                + "</tt:VideoSourceConfiguration>"
+                + "<tt:VideoEncoderConfiguration token=\"vec_" + n + "\">"
+                + "<tt:Name>JPEG_" + n + "</tt:Name>"
+                + "<tt:UseCount>1</tt:UseCount>"
+                + "<tt:Encoding>JPEG</tt:Encoding>"
+                + "<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"
+                + "<tt:Quality>4</tt:Quality>"
+                + "<tt:RateControl><tt:FrameRateLimit>25</tt:FrameRateLimit>"
+                + "<tt:BitrateLimit>8192</tt:BitrateLimit></tt:RateControl>"
+                + "</tt:VideoEncoderConfiguration>"
+                + "</trt:Profiles>";
+    }
+
+    /** profile_N → 摄像头编号（N-1），无法解析按 0 号处理 */
+    private static int cameraOfToken(String token) {
+        if (token == null) {
+            return 0;
+        }
+        int under = token.lastIndexOf('_');
+        try {
+            return Math.max(0, Integer.parseInt(token.substring(under + 1).trim()) - 1);
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     private static String soapBody(String inner) {
