@@ -9,6 +9,7 @@
  */
 #include <jni.h>
 #include <android/log.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <libusb.h>          /* 需先于 libuvc.h：提供 LIBUSB_API_VERSION（uvc_wrap 声明守卫依赖） */
@@ -27,6 +28,9 @@ static uvc_context_t *g_ctx = NULL;
 static uvc_device_handle_t *g_devh = NULL;
 static jclass g_captureClass = NULL; /* UvcCapture 全局引用：回调线程无应用类加载器，必须缓存 */
 static volatile int g_streaming = 0;
+/* 串行化启动/停止：多个调用方（界面/保活任务）可能并发拉起，
+ * 并发 uvc_init/uvc_exit 同一全局上下文会在 libusb 内部触发互斥锁销毁断言（实测） */
+static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void) reserved;
@@ -109,9 +113,7 @@ JNIEXPORT jboolean JNICALL
 Java_com_linuxsuren_tvuvc_UvcCapture_nativeStart(JNIEnv *env, jclass clazz,
                                                  jint fd, jint width, jint height, jint fps) {
     (void) clazz;
-    if (g_devh != NULL) {
-        return JNI_TRUE; /* 已在运行 */
-    }
+    jboolean result = JNI_FALSE;
     /* 在 Java 线程缓存回调类（AttachCurrentThread 的线程无法 FindClass 应用类） */
     if (g_captureClass == NULL) {
         jclass local = (*env)->FindClass(env, "com/linuxsuren/tvuvc/UvcCapture");
@@ -122,46 +124,47 @@ Java_com_linuxsuren_tvuvc_UvcCapture_nativeStart(JNIEnv *env, jclass clazz,
         g_captureClass = (*env)->NewGlobalRef(env, local);
         (*env)->DeleteLocalRef(env, local);
     }
-    if (uvc_init(&g_ctx, NULL) != UVC_SUCCESS) {
+    pthread_mutex_lock(&g_state_mutex);
+    if (g_devh != NULL) {
+        result = JNI_TRUE; /* 已在运行 */
+    } else if (uvc_init(&g_ctx, NULL) != UVC_SUCCESS) {
         LOGE("uvc_init failed");
         g_ctx = NULL;
-        return JNI_FALSE;
-    }
-    uvc_error_t rc = open_and_stream(fd, width, height, fps);
-    if (rc != UVC_SUCCESS) {
-        /* 自愈：进程异常退出后摄像头可能残留占用，复位 USB 口后重试一次 */
-        LOGI("first attempt failed (%d), resetting USB device and retrying", rc);
-        close_all();
-        if (ioctl(fd, USBDEVFS_RESET) != 0) {
-            LOGE("USBDEVFS_RESET failed");
-        }
-        usleep(500 * 1000);
-        if (uvc_init(&g_ctx, NULL) != UVC_SUCCESS) {
-            g_ctx = NULL;
-            return JNI_FALSE;
-        }
-        rc = open_and_stream(fd, width, height, fps);
+    } else {
+        uvc_error_t rc = open_and_stream(fd, width, height, fps);
         if (rc != UVC_SUCCESS) {
+            /* 自愈：进程异常退出后摄像头可能残留占用，复位 USB 口后重试一次 */
+            LOGI("first attempt failed (%d), resetting USB device and retrying", rc);
             close_all();
-            return JNI_FALSE;
+            if (ioctl(fd, USBDEVFS_RESET) != 0) {
+                LOGE("USBDEVFS_RESET failed");
+            }
+            usleep(500 * 1000);
+            if (uvc_init(&g_ctx, NULL) == UVC_SUCCESS) {
+                rc = open_and_stream(fd, width, height, fps);
+                if (rc != UVC_SUCCESS) {
+                    close_all();
+                } else {
+                    result = JNI_TRUE;
+                }
+            } else {
+                g_ctx = NULL;
+            }
+        } else {
+            result = JNI_TRUE;
         }
     }
-    return JNI_TRUE;
+    pthread_mutex_unlock(&g_state_mutex);
+    return result;
 }
 
 JNIEXPORT void JNICALL
 Java_com_linuxsuren_tvuvc_UvcCapture_nativeStop(JNIEnv *env, jclass clazz) {
     (void) env;
     (void) clazz;
+    pthread_mutex_lock(&g_state_mutex);
     g_streaming = 0;
-    if (g_devh != NULL) {
-        uvc_stop_streaming(g_devh);
-        uvc_close(g_devh);
-        g_devh = NULL;
-    }
-    if (g_ctx != NULL) {
-        uvc_exit(g_ctx);
-        g_ctx = NULL;
-    }
+    close_all();
+    pthread_mutex_unlock(&g_state_mutex);
     LOGI("streaming stopped");
 }

@@ -47,4 +47,12 @@ public class KeepAliveJob extends JobService {
             // 极少数 ROM 不支持 persisted 任务
         }
     }
+
+    /** 用户主动退出时必须取消保活任务，否则服务会被周期性拉起 */
+    public static void cancel(Context context) {
+        JobScheduler scheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+        if (scheduler != null) {
+            scheduler.cancel(JOB_ID);
+        }
+    }
 }

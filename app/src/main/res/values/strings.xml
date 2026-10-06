@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">tv-uvc-streamer</string>
+    <string name="foreground_channel">推流服务</string>
+    <string name="foreground_title">摄像头推流中</string>
+    <string name="btn_stop_exit">停止推流并退出</string>
 </resources>
