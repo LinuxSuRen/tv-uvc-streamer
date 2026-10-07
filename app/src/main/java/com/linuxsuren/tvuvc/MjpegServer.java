@@ -57,6 +57,10 @@ public final class MjpegServer {
     private static final Map<Integer, byte[]> LATEST = new HashMap<>();
     private static final Map<Integer, String> LABELS = new HashMap<>();
     private static final Map<Integer, Long> COUNTS = new HashMap<>();
+    /** 每路滑动窗口统计（帧计数 + 窗口起点 + 滚动 fps） */
+    private static final Map<Integer, long[]> FPS_WINDOW = new HashMap<>();
+    private static final Map<Integer, Long> FPS = new HashMap<>();
+    private static volatile String crashInfo;
     private static final Object LOCK = new Object();
     private static long totalFrames;
     private static long lastIndex;
@@ -79,7 +83,30 @@ public final class MjpegServer {
             LABELS.remove(camera);
             LATEST.remove(camera);
             COUNTS.remove(camera);
+            FPS_WINDOW.remove(camera);
+            FPS.remove(camera);
         }
+    }
+
+    /** 指定摄像头的累计帧数（看门狗与健康页用） */
+    public static long frameCount(int camera) {
+        synchronized (LOCK) {
+            Long count = COUNTS.get(camera);
+            return count == null ? 0L : count;
+        }
+    }
+
+    /** 指定摄像头的滚动帧率（约 3 秒窗口） */
+    public static long fps(int camera) {
+        synchronized (LOCK) {
+            Long fps = FPS.get(camera);
+            return fps == null ? 0L : fps;
+        }
+    }
+
+    /** 上次崩溃堆栈（状态页展示，由服务启动时注入） */
+    public static void setCrashInfo(String info) {
+        crashInfo = info;
     }
 
     /** 当前在推流的摄像头（编号 → 名称），快照拷贝 */
@@ -137,8 +164,21 @@ public final class MjpegServer {
             index = ++lastIndex;
             LATEST.put(camera, frame);
             Long count = COUNTS.get(camera);
-            COUNTS.put(camera, count == null ? 1L : count + 1);
+            long frames = count == null ? 1L : count + 1;
+            COUNTS.put(camera, frames);
             totalFrames++;
+            // 滚动 fps：3 秒窗口
+            long now = System.currentTimeMillis();
+            long[] win = FPS_WINDOW.get(camera);
+            if (win == null) {
+                win = new long[]{now, frames, 0};
+            } else if (now - win[0] >= 3000) {
+                win[2] = (frames - win[1]) * 1000 / Math.max(1, now - win[0]);
+                win[0] = now;
+                win[1] = frames;
+            }
+            FPS_WINDOW.put(camera, win);
+            FPS.put(camera, win[2]);
             LOCK.notifyAll();
         }
         for (FrameListener l : LISTENERS) {
@@ -310,11 +350,16 @@ public final class MjpegServer {
             int cam = e.getKey();
             String suffix = cam == 0 ? "" : "?cam=" + cam;
             body.append("<h3>").append(e.getValue()).append(" (camera ").append(cam).append(")</h3>")
+                    .append("<p>fps: ").append(fps(cam)).append(" · frames: ").append(frameCount(cam)).append("</p>")
                     .append("<p><a style='color:#8cf' href='http://").append(ip).append(':').append(PORT)
                     .append("/stream").append(suffix).append("'>/stream").append(suffix).append("</a>")
                     .append(" · <a style='color:#8cf' href='http://").append(ip).append(':').append(PORT)
                     .append("/snapshot.jpg").append(suffix).append("'>/snapshot.jpg").append(suffix).append("</a>")
                     .append("</p><p><img src='/snapshot.jpg").append(suffix).append("' width='480'></p>");
+        }
+        if (crashInfo != null && !crashInfo.isEmpty()) {
+            body.append("<h3>上次崩溃</h3><pre style='color:#f88;white-space:pre-wrap'>")
+                    .append(crashInfo).append("</pre>");
         }
         body.append("</body></html>");
         byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
