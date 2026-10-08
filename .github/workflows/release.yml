@@ -42,6 +42,10 @@ jobs:
 
       - name: Build APK
         run: gradle :app:assembleDebug --no-daemon --console=plain
+        env:
+          # Gradle 9 的 JVM HTTP/2 客户端对 google CDN 疑似兼容问题：
+          # 快速失败被静默记为"仓库无此构件"，禁用 HTTP/2 回落 1.1
+          GRADLE_OPTS: -Dorg.gradle.internal.disable.http2=true
 
       - name: Rename artifact
         run: cp app/build/outputs/apk/debug/app-debug.apk "tv-uvc-streamer-${GITHUB_REF_NAME}-universal.apk"
