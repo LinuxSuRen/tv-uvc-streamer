@@ -128,16 +128,25 @@ public class MainActivity extends Activity {
         super.onStart();
         crashInfo = CrashGuard.lastCrash(this);
         UsbDevice camera = StreamService.findCamera(usbManager);
-        if (camera == null && !BuiltInCamera.hasCamera(this)) {
+        boolean hasBuiltin = BuiltInCamera.hasCamera(this);
+        if (camera == null && !hasBuiltin) {
             renderStatus("未发现摄像头（USB 或内置）");
             return;
         }
+        // 内置相机授权与是否插着 USB 相机无关（部分整机内挂 USB 摄像头，
+        // 曾因此每次启动都被误导向 USB 授权弹框）；服务端本就优先内置路径
         boolean usbReady = camera != null && usbManager.hasPermission(camera);
-        boolean builtinReady = camera == null
+        boolean builtinReady = hasBuiltin
                 && checkSelfPermission(android.Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED;
         if (usbReady || builtinReady || serviceStarted) {
             startStreamService();
+            return;
+        }
+        if (hasBuiltin) {
+            // 内置相机在但未授权：优先走 CAMERA 运行时授权
+            requestPermissions(new String[]{android.Manifest.permission.CAMERA}, REQ_CAMERA);
+            renderStatus("等待相机授权…");
             return;
         }
         if (camera != null) {
@@ -146,10 +155,7 @@ public class MainActivity extends Activity {
                     PendingIntent.FLAG_IMMUTABLE);
             usbManager.requestPermission(camera, pi);
             renderStatus("等待 USB 授权确认…");
-            return;
         }
-        requestPermissions(new String[]{android.Manifest.permission.CAMERA}, REQ_CAMERA);
-        renderStatus("等待相机授权…");
     }
 
     @Override
