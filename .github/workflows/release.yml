@@ -20,10 +20,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # 手动安装 Gradle（不用 gradle/actions/setup-gradle：其注入的
+      # 依赖图/结果捕获 init 脚本在 Gradle 9 上出现"Resolved plugin
+      # 后立刻 not found"的假失败，实测日志可见）
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '9.2.1'
+        run: |
+          curl -sSfL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-9.2.1-bin.zip
+          unzip -q /tmp/gradle.zip -d "$HOME/gradle-dist"
+          echo "$HOME/gradle-dist/gradle-9.2.1/bin" >> "$GITHUB_PATH"
 
       # ubuntu runner 自带 Android SDK（含 cmdline-tools），只需接受 license，
       # NDK/CMake 由 AGP 按需自动安装（setup-android 的默认包 tools 已从
@@ -32,7 +36,7 @@ jobs:
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Build APK
-        run: gradle :app:assembleDebug --no-daemon --console=plain --info --refresh-dependencies
+        run: gradle :app:assembleDebug --no-daemon --console=plain
 
       - name: Rename artifact
         run: cp app/build/outputs/apk/debug/app-debug.apk "tv-uvc-streamer-${GITHUB_REF_NAME}-universal.apk"
