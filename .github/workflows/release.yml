@@ -18,7 +18,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       # 手动安装 Gradle（不用 gradle/actions/setup-gradle：其注入的
       # 依赖图/结果捕获 init 脚本在 Gradle 9 上出现"Resolved plugin
@@ -34,6 +34,11 @@ jobs:
       # SDK 仓库下架，会导致该 action 失败）
       - name: Accept SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Debug network to google maven
+        run: |
+          curl -sI -m 10 "https://dl.google.com/android/maven2/com/android/application/com.android.application.gradle.plugin/8.13.2/com.android.application.gradle.plugin-8.13.2.pom" | head -1
+          java -version 2>&1 | head -1
 
       - name: Build APK
         run: gradle :app:assembleDebug --no-daemon --console=plain
