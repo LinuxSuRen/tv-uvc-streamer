@@ -32,8 +32,10 @@ jobs:
       # ubuntu runner 自带 Android SDK（含 cmdline-tools），只需接受 license，
       # NDK/CMake 由 AGP 按需自动安装（setup-android 的默认包 tools 已从
       # SDK 仓库下架，会导致该 action 失败）
-      - name: Accept SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Accept SDK licenses and install NDK/CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.0.12077973" "cmake;3.22.1"
 
       - name: Debug network to google maven
         run: |
