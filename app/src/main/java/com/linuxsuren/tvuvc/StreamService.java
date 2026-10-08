@@ -193,7 +193,13 @@ public class StreamService extends Service {
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tvuvc:stream");
         wakeLock.acquire();
         WifiManager wm = (WifiManager) getSystemService(Context.WIFI_SERVICE);
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL, "tvuvc:stream");
+        // Android 10+ 上 WIFI_MODE_FULL 已被系统无视；LOW_LATENCY 才真正关闭
+        // WiFi 省电（实测部分新机型省电开启时大流量发送路径黑洞，快照/流卡死）
+        wifiLock = wm.createWifiLock(
+                android.os.Build.VERSION.SDK_INT >= 29
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        : WifiManager.WIFI_MODE_FULL,
+                "tvuvc:stream");
         wifiLock.acquire();
     }
 
