@@ -25,8 +25,11 @@ jobs:
         with:
           gradle-version: '9.2.1'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu runner 自带 Android SDK（含 cmdline-tools），只需接受 license，
+      # NDK/CMake 由 AGP 按需自动安装（setup-android 的默认包 tools 已从
+      # SDK 仓库下架，会导致该 action 失败）
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Build APK
         run: gradle :app:assembleDebug --no-daemon --console=plain
