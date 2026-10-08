@@ -40,6 +40,7 @@ public final class BuiltInCamera {
     /** 单路相机会话 */
     private static final class Cam {
         final int index;
+        final String id; // Camera2 相机 ID，看门狗重开用
         final String label;
         final int facing;
         final int sensorOrientation;
@@ -48,9 +49,11 @@ public final class BuiltInCamera {
         CameraDevice device;
         CameraCaptureSession session;
         volatile boolean streaming;
+        volatile int reopenFailures;
 
-        Cam(int index, String label, int facing, int sensorOrientation, boolean jpegDirect, ImageReader reader) {
+        Cam(int index, String id, String label, int facing, int sensorOrientation, boolean jpegDirect, ImageReader reader) {
             this.index = index;
+            this.id = id;
             this.label = label;
             this.facing = facing;
             this.sensorOrientation = sensorOrientation;
@@ -64,6 +67,13 @@ public final class BuiltInCamera {
     private static Handler handler;
     private static DeviceOrientation orientation;
     private static boolean running;
+    private static android.content.Context appContext;
+    /** 帧停滞看门狗：>6s 无新帧重开该路会话，连续 3 次整体重启（参考 ohos-ipcam-streamer） */
+    private static Thread watchdog;
+    private static volatile long cooldownUntil;
+    private static final java.util.Map<Integer, Long> LAST_FRAMES = new java.util.HashMap<>();
+    private static final java.util.Map<Integer, Long> LAST_ADVANCE = new java.util.HashMap<>();
+    private static final java.util.Map<Integer, Integer> STALL_COUNT = new java.util.HashMap<>();
 
     private BuiltInCamera() {
     }
@@ -190,7 +200,7 @@ public final class BuiltInCamera {
                     }
 
                     final int index = i;
-                    final Cam cam = new Cam(index, labelOf(facing, i), facing,
+                    final Cam cam = new Cam(index, id, labelOf(facing, i), facing,
                             so == null ? 0 : so, jpegDirect,
                             ImageReader.newInstance(useSize.getWidth(), useSize.getHeight(),
                                     jpegDirect ? ImageFormat.JPEG : ImageFormat.YUV_420_888, 3));
@@ -237,17 +247,20 @@ public final class BuiltInCamera {
                                                 applyRepeating(cam);
                                                 cam.streaming = true;
                                                 MjpegServer.registerCamera(cam.index, cam.label);
+                                                cooldownUntil = System.currentTimeMillis() + 8000;
                                                 if (streaming.incrementAndGet() == 1) {
                                                     running = true;
                                                     // 跟随设备摆放动态转正画面（平放保持上次姿态）
-                                                    orientation = DeviceOrientation.start(context,
-                                                            deg -> handler.post(() -> {
-                                                                synchronized (CAMS) {
-                                                                    for (Cam c : CAMS) {
-                                                                        applyRepeating(c);
+                                                    if (orientation == null) {
+                                                        orientation = DeviceOrientation.start(context,
+                                                                deg -> handler.post(() -> {
+                                                                    synchronized (CAMS) {
+                                                                        for (Cam c : CAMS) {
+                                                                            applyRepeating(c);
+                                                                        }
                                                                     }
-                                                                }
-                                                            }));
+                                                                }));
+                                                    }
                                                     if (onReady != null) {
                                                         onReady.run();
                                                     }
@@ -270,12 +283,24 @@ public final class BuiltInCamera {
 
                         @Override
                         public void onDisconnected(CameraDevice device) {
+                            if (cam.streaming && running) {
+                                // 运行中被系统/高优先级客户端踢出：自愈重开
+                                android.util.Log.w(TAG, "camera " + cam.index + " disconnected, healing");
+                                reopenCam(cam);
+                                return;
+                            }
                             closeCam(cam);
+                            pending.decrementAndGet();
+                            checkAllFailed(pending, streaming, onFailure);
                         }
 
                         @Override
                         public void onError(CameraDevice device, int error) {
                             android.util.Log.e(TAG, "camera " + cam.index + " error: " + error);
+                            if (cam.streaming && running) {
+                                reopenCam(cam);
+                                return;
+                            }
                             closeCam(cam);
                             pending.decrementAndGet();
                                                 checkAllFailed(pending, streaming, onFailure);
@@ -288,10 +313,171 @@ public final class BuiltInCamera {
                 }
             }
             checkAllFailed(pending, streaming, onFailure);
+            appContext = context.getApplicationContext();
+            cooldownUntil = System.currentTimeMillis() + 10000;
+            startWatchdog();
             return true;
         } catch (Exception e) {
             android.util.Log.e(TAG, "builtin camera start failed", e);
             return false;
+        }
+    }
+
+    /** 帧停滞看门狗：每秒巡检各路帧数，>6 秒不前进重开该路，连续 3 次整体重启 */
+    private static void startWatchdog() {
+        if (watchdog != null && watchdog.isAlive()) {
+            return;
+        }
+        watchdog = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                long now = System.currentTimeMillis();
+                if (now < cooldownUntil || !running) {
+                    continue;
+                }
+                List<Cam> snapshot;
+                synchronized (CAMS) {
+                    snapshot = new ArrayList<>(CAMS);
+                }
+                for (Cam cam : snapshot) {
+                    if (!cam.streaming) {
+                        continue;
+                    }
+                    long frames = MjpegServer.frameCount(cam.index);
+                    Long last = LAST_FRAMES.get(cam.index);
+                    if (last == null || frames > last) {
+                        LAST_FRAMES.put(cam.index, frames);
+                        LAST_ADVANCE.put(cam.index, now);
+                        STALL_COUNT.put(cam.index, 0);
+                        continue;
+                    }
+                    Long advance = LAST_ADVANCE.get(cam.index);
+                    if (advance == null || advance <= 0) {
+                        LAST_ADVANCE.put(cam.index, now);
+                        continue;
+                    }
+                    if (now - advance > 6000) {
+                        LAST_ADVANCE.put(cam.index, now);
+                        Integer stalls = STALL_COUNT.get(cam.index);
+                        int count = (stalls == null ? 0 : stalls) + 1;
+                        STALL_COUNT.put(cam.index, count);
+                        // 冷却期：等待重开/重启生效，避免连续触发
+                        cooldownUntil = now + 12000;
+                        if (count >= 3) {
+                            STALL_COUNT.put(cam.index, 0);
+                            android.util.Log.w(TAG, "camera " + cam.index + " repeated stall, full restart");
+                            if (appContext != null) {
+                                StreamService.restart(appContext);
+                            }
+                            return;
+                        }
+                        android.util.Log.w(TAG, "camera " + cam.index + " frame stall, reopening");
+                        reopenCam(cam);
+                    }
+                }
+            }
+        }, "cam-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
+    /** 重开单路相机会话（熄屏唤醒 / HAL 卡死 / 被系统高优先级客户端踢出后自愈） */
+    private static void reopenCam(final Cam cam) {
+        final android.content.Context ctx = appContext;
+        if (ctx == null) {
+            return;
+        }
+        CameraManager manager = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        closeCam(cam);
+        // 重新入册：closeCam 已将其移出，重开成功后看门狗/方向回调才能继续覆盖这路
+        synchronized (CAMS) {
+            CAMS.add(cam);
+        }
+        int live = 0;
+        synchronized (CAMS) {
+            for (Cam c : CAMS) {
+                if (c.streaming) {
+                    live++;
+                }
+            }
+        }
+        final AtomicInteger streamingCount = new AtomicInteger(live);
+        final AtomicInteger pending = new AtomicInteger(1);
+        try {
+            manager.openCamera(cam.id, new CameraDevice.StateCallback() {
+                @Override
+                public void onOpened(CameraDevice device) {
+                    cam.device = device;
+                    cam.reopenFailures = 0;
+                    try {
+                        device.createCaptureSession(Arrays.asList(cam.reader.getSurface()),
+                                new CameraCaptureSession.StateCallback() {
+                                    @Override
+                                    public void onConfigured(CameraCaptureSession configured) {
+                                        cam.session = configured;
+                                        applyRepeating(cam);
+                                        cam.streaming = true;
+                                        MjpegServer.registerCamera(cam.index, cam.label);
+                                        cooldownUntil = System.currentTimeMillis() + 8000;
+                                        streamingCount.incrementAndGet();
+                                        android.util.Log.i(TAG, "camera " + cam.index + " reopened (heal)");
+                                    }
+
+                                    @Override
+                                    public void onConfigureFailed(CameraCaptureSession s) {
+                                        pending.decrementAndGet();
+                                        healFailed(cam, pending, streamingCount);
+                                    }
+                                }, handler);
+                    } catch (Exception e) {
+                        pending.decrementAndGet();
+                        healFailed(cam, pending, streamingCount);
+                    }
+                }
+
+                @Override
+                public void onDisconnected(CameraDevice device) {
+                    healFailed(cam, pending, streamingCount);
+                }
+
+                @Override
+                public void onError(CameraDevice device, int error) {
+                    android.util.Log.e(TAG, "reopen camera " + cam.index + " error: " + error);
+                    healFailed(cam, pending, streamingCount);
+                }
+            }, handler);
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "reopen camera " + cam.index + " failed", e);
+            pending.decrementAndGet();
+            healFailed(cam, pending, streamingCount);
+        }
+    }
+
+    /** 单路重开失败：连续 3 次升级为整体重启，否则稍后由看门狗再触发 */
+    private static void healFailed(Cam cam, AtomicInteger pending, AtomicInteger streamingCount) {
+        closeCam(cam);
+        cam.reopenFailures++;
+        android.util.Log.w(TAG, "camera " + cam.index + " heal failed (" + cam.reopenFailures + ")");
+        if (cam.reopenFailures >= 3) {
+            cam.reopenFailures = 0;
+            fullRestart();
+            return;
+        }
+        cooldownUntil = System.currentTimeMillis() + 10000;
+        checkAllFailed(pending, streamingCount, () -> fullRestart());
+    }
+
+    private static void fullRestart() {
+        android.util.Log.e(TAG, "no camera alive after heal attempts, full pipeline restart");
+        if (appContext != null) {
+            StreamService.restartPipeline(appContext);
         }
     }
 
@@ -473,6 +659,13 @@ public final class BuiltInCamera {
 
     public static synchronized void stop() {
         running = false;
+        if (watchdog != null) {
+            watchdog.interrupt();
+            watchdog = null;
+        }
+        LAST_FRAMES.clear();
+        LAST_ADVANCE.clear();
+        STALL_COUNT.clear();
         if (orientation != null) {
             orientation.stop();
             orientation = null;

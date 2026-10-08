@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class StreamService extends Service {
 
     static final String EXTRA_FD = "fd";
+    static final String EXTRA_RESTART_PIPELINE = "restart_pipeline";
     private static final int WANT_WIDTH = 1280;
     private static final int WANT_HEIGHT = 720;
     private static final int WANT_FPS = 25;
@@ -72,6 +73,13 @@ public class StreamService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         promoteToForeground();
         KeepAliveJob.schedule(this);
+        if (intent != null && intent.getBooleanExtra(EXTRA_RESTART_PIPELINE, false) && running) {
+            // 管线重启：保留服务与服务器，仅重建采集（看门狗升级恢复路径）
+            android.util.Log.w("tv-uvc-streamer", "restarting capture pipeline");
+            running = false;
+            starting.set(false);
+            BuiltInCamera.stop();
+        }
         if (running || !starting.compareAndSet(false, true)) {
             return START_STICKY;
         }
@@ -84,19 +92,26 @@ public class StreamService extends Service {
                 == android.content.pm.PackageManager.PERMISSION_GRANTED;
         if (builtinAuthorized) {
             new Thread(() -> {
+                // 服务器先行（参考 ohos-ipcam-streamer）：相机暖机期间拉流端即可连接；
+                // 相机全败时由 stopSelf 兜底回收服务
+                try {
+                    MjpegServer.setCrashInfo(CrashGuard.lastCrash(StreamService.this));
+                } catch (Exception ignored) {
+                }
+                try {
+                    MjpegServer.start();
+                    RtspServer.start();
+                    OnvifServer.start(StreamService.this);
+                } catch (Exception e) {
+                    android.util.Log.e("tv-uvc-streamer", "server start failed", e);
+                    stopSelf();
+                    return;
+                }
                 boolean accepted = BuiltInCamera.start(this, WANT_WIDTH, WANT_HEIGHT,
                         () -> {
-                            try {
-                                MjpegServer.start();
-                                RtspServer.start();
-                                OnvifServer.start(StreamService.this);
-                                running = true;
-                                starting.set(false);
-                                acquireLocks();
-                            } catch (Exception e) {
-                                android.util.Log.e("tv-uvc-streamer", "server start failed", e);
-                                stopSelf();
-                            }
+                            running = true;
+                            starting.set(false);
+                            acquireLocks();
                         },
                         () -> startFromUsb());
                 if (!accepted) {
@@ -186,6 +201,21 @@ public class StreamService extends Service {
         context.stopService(new Intent(context, StreamService.class));
         new android.os.Handler(android.os.Looper.getMainLooper())
                 .postDelayed(() -> start(context), 800);
+    }
+
+    /**
+     * 管线整体重启（看门狗升级恢复用）：服务保持存活，只重建采集管线。
+     * 不走 stopService——应用会跌入 cached 态，定制 ROM 会静默拒绝延迟的
+     * 后台 startService（实测服务记录归零、管线死寂）。
+     */
+    static void restartPipeline(Context context) {
+        Intent intent = new Intent(context, StreamService.class);
+        intent.putExtra(EXTRA_RESTART_PIPELINE, true);
+        try {
+            context.startService(intent);
+        } catch (IllegalStateException ignored) {
+            // 极端场景服务已死：交给 KeepAliveJob 周期自愈
+        }
     }
 
     private void acquireLocks() {
