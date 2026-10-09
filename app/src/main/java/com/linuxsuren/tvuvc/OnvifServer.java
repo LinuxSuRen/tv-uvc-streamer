@@ -254,8 +254,8 @@ public final class OnvifServer {
             client.setSoTimeout(10000);
             String request = readRequest(client.getInputStream());
             String response = handleSoap(request);
-            byte[] body = response.getBytes(StandardCharsets.UTF_8);
             OutputStream out = client.getOutputStream();
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
             String header = "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml; charset=utf-8\r\n"
                     + "Content-Length: " + body.length + "\r\nConnection: close\r\n\r\n";
             out.write(header.getBytes(StandardCharsets.US_ASCII));
@@ -270,28 +270,57 @@ public final class OnvifServer {
         }
     }
 
+    /**
+     * 按 HTTP 协议读取请求：头部读到空行（\r\n\r\n）即止，再按 Content-Length
+     * 精确读取 SOAP 体。旧实现盲读等待 </s:Envelope> 或 10s 超时——浏览器 GET
+     * 无 SOAP 体，每次响应都要等满 soTimeout，表现为"无法访问/超时"（真机实测
+     * 恰好 10.05s）。字节层扫描头边界、整体解码，避免多字节字符被分块读截断。
+     */
     private static String readRequest(InputStream in) throws IOException {
-        StringBuilder sb = new StringBuilder();
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[8192];
-        int total = 0;
-        // 粗略读取：SOAP 请求都很小，读到超时或缓冲上限即可
-        while (total < 65536) {
-            int n;
-            try {
-                n = in.read(buf);
-            } catch (java.net.SocketTimeoutException e) {
-                break;
-            }
+        int headerEnd = -1; // 头部结束位置（\r\n\r\n 的末字节下标+1）
+        while (headerEnd < 0 && bos.size() < 65536) {
+            int n = in.read(buf);
             if (n < 0) {
                 break;
             }
-            sb.append(new String(buf, 0, n, StandardCharsets.UTF_8));
-            total += n;
-            if (total > 4 && sb.indexOf("</s:Envelope>") > 0) {
-                break;
+            bos.write(buf, 0, n);
+            headerEnd = findHeaderEnd(bos.toByteArray());
+        }
+        byte[] all = bos.toByteArray();
+        if (headerEnd < 0) {
+            return new String(all, StandardCharsets.UTF_8);
+        }
+        String head = new String(java.util.Arrays.copyOfRange(all, 0, headerEnd), StandardCharsets.UTF_8);
+        long contentLength = 0;
+        Matcher m = Pattern.compile("(?i)^Content-Length:\\s*(\\d+)", Pattern.MULTILINE)
+                .matcher(head);
+        if (m.find()) {
+            try {
+                contentLength = Long.parseLong(m.group(1).trim());
+            } catch (NumberFormatException ignored) {
             }
         }
-        return sb.toString();
+        while (all.length - headerEnd < contentLength && all.length < 65536) {
+            int n = in.read(buf);
+            if (n < 0) {
+                break;
+            }
+            bos.write(buf, 0, n);
+            all = bos.toByteArray();
+        }
+        return new String(all, StandardCharsets.UTF_8);
+    }
+
+    /** 头部结束（\r\n\r\n）位置：返回其末字节之后的位置，未找到为 -1 */
+    private static int findHeaderEnd(byte[] data) {
+        for (int i = 0; i + 3 < data.length; i++) {
+            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
+                return i + 4;
+            }
+        }
+        return -1;
     }
 
     private static String handleSoap(String request) {
