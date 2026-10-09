@@ -234,13 +234,23 @@ public final class MjpegServer {
     private static void serve(Socket client) {
         try {
             client.setTcpNoDelay(true);
-            String path = readRequestPath(client.getInputStream());
-            if (path == null) {
+            String head = readRequestHead(client.getInputStream());
+            if (head == null) {
                 client.close();
                 return;
             }
+            String path = pathOf(head);
             int camera = cameraOf(path);
             OutputStream out = client.getOutputStream();
+            // 认证门禁：开启后所有路径（状态页/快照/MJPEG）要求 HTTP Basic，
+            // 浏览器原生弹登录框；放在路由分发前，401 不泄露路由信息
+            if (Auth.isEnabled() && !Auth.verifyHttpBasic(headerValue(head, "Authorization"))) {
+                out.write(("HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"" + Auth.REALM
+                        + "\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                return;
+            }
             if (path.startsWith("/snapshot.jpg")) {
                 writeSnapshot(out, camera);
             } else if (path.startsWith("/stream")) {
@@ -279,7 +289,8 @@ public final class MjpegServer {
         return 0;
     }
 
-    private static String readRequestPath(InputStream in) throws IOException {
+    /** 读取完整请求头（到空行），连接被关闭（无数据）返回 null */
+    private static String readRequestHead(InputStream in) throws IOException {
         StringBuilder sb = new StringBuilder();
         int c;
         int nl = 0;
@@ -292,13 +303,29 @@ public final class MjpegServer {
                 nl = 0;
             }
         }
-        String first = sb.length() > 0 ? sb.substring(0, sb.indexOf("\r\n") > 0 ? sb.indexOf("\r\n") : sb.length()) : "";
-        // 形如 GET /stream HTTP/1.1
+        return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    /** 从请求头文本提取请求行内的路径（形如 GET /stream?cam=1 HTTP/1.1） */
+    private static String pathOf(String head) {
+        int eol = head.indexOf("\r\n");
+        String first = eol > 0 ? head.substring(0, eol) : head;
         String[] parts = first.split(" ");
         if (parts.length >= 2) {
             return parts[1];
         }
         return "/";
+    }
+
+    /** 不区分大小写提取指定头域的值，缺省返回空串 */
+    private static String headerValue(String head, String name) {
+        for (String line : head.split("\r\n")) {
+            int colon = line.indexOf(':');
+            if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase(name)) {
+                return line.substring(colon + 1).trim();
+            }
+        }
+        return "";
     }
 
     private static byte[] latestFrame(int camera) throws IOException {
@@ -353,7 +380,9 @@ public final class MjpegServer {
                 .append("<h2>tv-uvc-streamer</h2>")
                 .append("<p>device: ").append(android.os.Build.MANUFACTURER).append(' ')
                 .append(android.os.Build.MODEL)
-                .append(" (Android ").append(android.os.Build.VERSION.RELEASE).append(")</p>");
+                .append(" (Android ").append(android.os.Build.VERSION.RELEASE).append(")</p>")
+                .append("<p>auth: ").append(Auth.isEnabled()
+                        ? "on (" + Auth.getUser() + ")" : "off").append("</p>");
         if (cams.isEmpty()) {
             body.append("<p>frames: ").append(totalFrames).append("</p>");
         }

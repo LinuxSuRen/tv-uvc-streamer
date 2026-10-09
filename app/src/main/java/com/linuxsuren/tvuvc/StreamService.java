@@ -88,6 +88,7 @@ public class StreamService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         promoteToForeground();
         KeepAliveJob.schedule(this);
+        applyAuthConfig();
         if (intent != null && intent.getBooleanExtra(EXTRA_RESTART_PIPELINE, false) && running) {
             // UVC 正在推流：重启请求多半来自交接空窗期的僵尸误判（标签未及挂上），
             // 不是真实故障——保持工作中的采集源，只补挂标签（重启风暴曾把刚
@@ -293,6 +294,18 @@ public class StreamService extends Service {
                 .setContentText(MjpegServer.url() + "stream")
                 .setOngoing(true);
         startForeground(NOTIFICATION_ID, builder.build());
+    }
+
+    /**
+     * 认证凭证随服务（自）启动重放：设置页变更时已即时注入 Auth 静态配置，
+     * 但进程被杀后由 KeepAliveJob/AutoStartReceiver 拉起时静态字段已丢，须从
+     * 私有 SharedPreferences 重放（口令明文存私有沙箱：Digest 服务端校验需明文参与哈希）。
+     */
+    private void applyAuthConfig() {
+        android.content.SharedPreferences prefs = getSharedPreferences("tvuvc", MODE_PRIVATE);
+        Auth.configure(prefs.getBoolean("auth_enabled", false),
+                prefs.getString("auth_user", ""),
+                prefs.getString("auth_pass", ""));
     }
 
     /** 统一启动入口：所有机型走纯后台服务（targetSdk 23 豁免 API 26+ 后台限制） */

@@ -31,6 +31,21 @@ USB 摄像头 (UVC/MJPEG)
 | HTTP MJPEG | `http://<电视IP>:8090/stream`（浏览器直接看）|
 | 单帧快照 | `http://<电视IP>:8090/snapshot.jpg` |
 
+## 访问认证（可选）
+
+应用界面提供「访问认证」开关与账号设置（单一账号，RTSP/HTTP/ONVIF 三服务共用；默认关闭，升级零破坏）。开启后：
+
+- **RTSP**：HTTP Digest（MD5，无 qop 兼容形态）+ Basic，`OPTIONS` 放行（客户端能力探测），其余方法须携带凭证，nonce 按连接签发：
+
+```bash
+ffplay -rtsp_transport tcp rtsp://admin:密码@<设备IP>:8554/cam
+```
+
+- **HTTP**：状态页/快照/MJPEG 全部要求 Basic，浏览器原生弹登录框
+- **ONVIF**：WS-Security UsernameToken（PasswordDigest = `Base64(SHA1(nonce+Created+口令))`，Created ±5 分钟；兼容 PasswordText）。`GetSystemDateAndTime`/`GetCapabilities`/`GetServices` 免认证（pre-auth 惯例，供对时与能力发现），其余操作未授权回 HTTP 401；NVR/onvif-ai 在设备配置里填同一账号即可；WS-Discovery 发现不设防
+- 口令明文存于应用私有 SharedPreferences（RTSP Digest 服务端校验需明文参与哈希，无法只存摘要）；设置变更即时生效，无需重启推流
+- 用户名/口令建议使用 ASCII 字符（RTSP/Digest 头部的非 ASCII 编码在各客户端间无统一惯例）
+
 ## 构建
 
 依赖：JDK 17+、Android SDK（platforms;android-34、build-tools;34.0.0、cmake;3.22.1）、NDK r27c。
@@ -65,7 +80,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 - 仅透传 MJPEG，不做解码；分辨率协商失败会提示（可改 `StreamService` 中的宽高帧率常量）
 - RTSP 采用 RFC 2435 打包：解析帧内 DQT 量化表与 SOS 扫描数据，按分片偏移打包，ffmpeg 实测可解
 - 采集启动失败时自动执行 `USBDEVFS_RESET` 复位重试（进程异常退出后的接口残留自愈）
-- 仅供局域网开发用途，所有服务无鉴权
+- 仅供局域网开发用途；跨网段/不可信网络暴露请开启「访问认证」
 
 ## 已验证设备
 

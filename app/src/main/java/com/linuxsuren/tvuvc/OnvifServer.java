@@ -255,6 +255,13 @@ public final class OnvifServer {
             String request = readRequest(client.getInputStream());
             String response = handleSoap(request);
             OutputStream out = client.getOutputStream();
+            if (response == null) {
+                // 认证拒绝：按 ONVIF 客户端兼容惯例回 HTTP 401（空体）
+                out.write(("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                return;
+            }
             byte[] body = response.getBytes(StandardCharsets.UTF_8);
             String header = "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml; charset=utf-8\r\n"
                     + "Content-Length: " + body.length + "\r\nConnection: close\r\n\r\n";
@@ -323,8 +330,20 @@ public final class OnvifServer {
         return -1;
     }
 
+    /** 处理 SOAP 请求；认证未通过返回 null（serve 层转 HTTP 401） */
     private static String handleSoap(String request) {
         String ip = MjpegServer.lanAddress();
+        // 认证门禁：pre-auth 白名单（GetSystemDateAndTime 对时/GetCapabilities/GetServices
+        // 能力发现）放行，其余操作（GetProfiles/GetStreamUri/快照/设备信息）要求
+        // WS-Security UsernameToken；WS-Discovery 发现不设防
+        if (Auth.isEnabled()
+                && !request.contains("GetSystemDateAndTime")
+                && !request.contains("GetCapabilities")
+                && !request.contains("GetServices")
+                && !Auth.verifyWsUsernameToken(request)) {
+            android.util.Log.w("tv-uvc-onvif", "soap 401 unauthorized");
+            return null;
+        }
         if (request.contains("GetSystemDateAndTime")) {
             return soapBody("<td:GetSystemDateAndTimeResponse>"
                     + "<td:SystemDateAndTime><tt:DateTimeType>Manual</tt:DateTimeType>"

@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF111111">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="16dp"
+            android:text="@string/auth_title"
+            android:textColor="#FFEEEEEE"
+            android:textSize="22sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/auth_scope_desc"
+            android:textColor="#FF888888"
+            android:textSize="13sp" />
+
+        <Switch
+            android:id="@+id/auth_switch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="@string/auth_switch_label"
+            android:textColor="#FFEEEEEE"
+            android:textSize="16sp" />
+
+        <EditText
+            android:id="@+id/auth_user"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:hint="@string/auth_user_hint"
+            android:inputType="text"
+            android:textColor="#FFEEEEEE"
+            android:textColorHint="#FF888888" />
+
+        <EditText
+            android:id="@+id/auth_pass"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/auth_pass_hint"
+            android:inputType="textPassword"
+            android:textColor="#FFEEEEEE"
+            android:textColorHint="#FF888888" />
+
+        <CheckBox
+            android:id="@+id/auth_show_pass"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/auth_show_password"
+            android:textColor="#FFBBBBBB"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/auth_save"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/auth_save"
+            android:textColor="#FFEEEEEE"
+            android:textSize="16sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/auth_hint"
+            android:textColor="#FF888888"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>

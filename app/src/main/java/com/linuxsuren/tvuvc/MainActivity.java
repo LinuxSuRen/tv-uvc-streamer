@@ -80,6 +80,10 @@ public class MainActivity extends Activity {
         });
 
         buildCameraSelector();
+        // 认证设置独立页面（查看/修改密码、开关三服务共享账号）
+        Button authSettings = findViewById(R.id.auth_settings);
+        authSettings.setOnClickListener(v ->
+                startActivity(new Intent(this, AuthSettingsActivity.class)));
     }
 
     /** 多摄设备显示相机选择：自动（分辨率最高）或指定某一颗；不支持并发的硬件靠此切换 */
@@ -228,6 +232,8 @@ public class MainActivity extends Activity {
                     .append("快照   ").append(MjpegServer.url()).append("snapshot.jpg\n")
                     .append("ONVIF  http://").append(MjpegServer.lanAddress())
                     .append(':').append(OnvifServer.HTTP_PORT).append("/onvif/device_service\n\n")
+                    .append("认证   ").append(Auth.isEnabled()
+                            ? "开启（" + Auth.getUser() + "）" : "关闭").append("\n\n")
                     .append("按返回键可保持后台推流");
         } else {
             sb.append("服务未启动");

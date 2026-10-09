@@ -85,10 +85,13 @@ public final class RtspServer {
     private static void serve(Socket socket) {
         try {
             socket.setSoTimeout(30000);
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
+            // ISO-8859-1 无损保留字节：Authorization 头（Basic 凭据/Digest 参数）不做有损转换
+            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.ISO_8859_1));
             OutputStream out = socket.getOutputStream();
             String session = null;
             Client client = null;
+            // 本连接最近签发的 Digest nonce：客户端带旧 nonce 重试视为过期，重挑战
+            String authNonce = "";
             String line;
             while ((line = in.readLine()) != null) {
                 if (line.isEmpty()) {
@@ -101,6 +104,7 @@ public final class RtspServer {
                 // 读掉该请求剩余头部（CSeq 必须原样回显，ffmpeg 等客户端校验不匹配会断连）
                 String cseq = null;
                 String transport = null;
+                String authorization = null;
                 String h;
                 while ((h = in.readLine()) != null && !h.isEmpty()) {
                     String lower = h.toLowerCase(Locale.US);
@@ -108,10 +112,25 @@ public final class RtspServer {
                         cseq = h.substring(h.indexOf(':') + 1).trim();
                     } else if (lower.startsWith("transport:")) {
                         transport = h.substring(h.indexOf(':') + 1).trim();
+                    } else if (lower.startsWith("authorization:")) {
+                        // 值内可能再含冒号（Digest 参数），去掉键名后取整行
+                        authorization = h.substring(h.indexOf(':') + 1).trim();
                     }
                 }
                 if (cseq == null) {
                     cseq = "0";
+                }
+                // 认证门禁：OPTIONS 放行（客户端能力探测），其余方法必须携带有效
+                // Basic/Digest 凭证；Digest nonce 按连接签发，不匹配即重挑战
+                if (Auth.isEnabled() && !"OPTIONS".equals(method)) {
+                    if (!Auth.verifyRtsp(method, authorization, authNonce)) {
+                        authNonce = Auth.randomNonce();
+                        write(out, "RTSP/1.0 401 Unauthorized\r\nCSeq: " + cseq
+                                + "\r\nWWW-Authenticate: Digest realm=\"" + Auth.REALM
+                                + "\", nonce=\"" + authNonce + "\", algorithm=MD5"
+                                + "\r\nWWW-Authenticate: Basic realm=\"" + Auth.REALM + "\"\r\n\r\n");
+                        continue;
+                    }
                 }
                 switch (method) {
                     case "OPTIONS":
