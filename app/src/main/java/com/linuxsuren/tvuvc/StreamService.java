@@ -159,12 +159,18 @@ public class StreamService extends Service {
 
     private void startFromUsb() {
         if (running) {
+            // UVC 已在推流：回退循环中的内置尝试可能与 UVC 共用 0 号槽位，
+            // closeCam 会连带反注册 UVC 的标签——此处补挂，状态页/ONVIF 才能恢复枚举
+            MjpegServer.registerCamera(0, "USB 摄像头");
             starting.set(false);
             return;
         }
+        // 多颗 USB 相机并存时只在已授权设备里选：findCamera 的 HashMap 迭代
+        // 顺序不稳定，两次调用可能返回不同设备（曾导致回退判定与实际启动
+        // 选到不同相机，未授权即静默退出，Max2.0 双 UVC 实测）
         UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
-        UsbDevice camera = findCamera(usbManager);
-        if (camera == null || !usbManager.hasPermission(camera)) {
+        UsbDevice camera = findAuthorizedCamera(usbManager);
+        if (camera == null) {
             starting.set(false);
             stopSelf();
             return;
@@ -199,10 +205,14 @@ public class StreamService extends Service {
     }
 
     /**
-     * 内置相机全部失败的处理：开机阶段相机 HAL 可能尚未就绪（或被特权应用暂时
-     * 占满），短退避重试几轮再回退 USB；曾经「一次失败立即放弃」，开机自启只能
-     * 干等 15 分钟 JobScheduler 周期。多路相机失败回调可能并发，靠 starting 的
-     * CAS 保证单次尝试只处理一次。
+     * 内置相机全部失败的处理。策略是「优先保障有摄像头可用，而不是硬抢某一颗」：
+     * <ul>
+     *   <li>有已授权的 USB 摄像头 → 立即回退 UVC，不浪费重试时间
+     *       （内置相机被特权应用抢占的设备上，UVC 是唯一可用来源，Max2.0 实测）</li>
+     *   <li>没有 USB 替代 → 短退避重试（开机阶段相机 HAL 可能尚未就绪，
+     *       立即放弃要干等 15 分钟 JobScheduler）</li>
+     * </ul>
+     * 多路相机失败回调可能并发，靠 starting 的 CAS 保证单次尝试只处理一次。
      * <p>
      * 时间闸门：开机时 USB 总线枚举风暴（WiFi/触摸模块逐个上线）会产生连环
      * startService，每次都是独立相机尝试——间隔不足退避时长的失败视为风暴
@@ -210,6 +220,14 @@ public class StreamService extends Service {
      */
     private void builtinAllFailed() {
         if (!starting.compareAndSet(true, false)) {
+            return;
+        }
+        // 有可用的 USB 相机：立即回退，重试只在别无选择时进行
+        UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        if (findAuthorizedCamera(usbManager) != null) {
+            android.util.Log.w("tv-uvc-streamer", "builtin cameras all failed, falling back to USB camera");
+            builtinFailures = 0;
+            startFromUsb();
             return;
         }
         long now = android.os.SystemClock.elapsedRealtime();
@@ -292,8 +310,11 @@ public class StreamService extends Service {
         intent.putExtra(EXTRA_RESTART_PIPELINE, true);
         try {
             context.startService(intent);
-        } catch (IllegalStateException ignored) {
-            // 极端场景服务已死：交给 KeepAliveJob 周期自愈
+        } catch (IllegalStateException e) {
+            // 定制 ROM 会在应用退后台后拒绝进程内 startService（即使 FGS 存活，
+            // Max2.0 实测：看门狗 fullRestart 静默失效、管线死寂）。借道
+            // JobScheduler 立即任务的白名单上下文重启，2 秒内生效
+            KeepAliveJob.scheduleImmediate(context);
         }
     }
 
@@ -327,6 +348,17 @@ public class StreamService extends Service {
         HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
         for (UsbDevice device : devices.values()) {
             if (hasVideoInterface(device)) {
+                return device;
+            }
+        }
+        return null;
+    }
+
+    /** 第一颗已授权的视频类 USB 设备（多颗并存时迭代顺序不稳定，只认授权集） */
+    static UsbDevice findAuthorizedCamera(UsbManager usbManager) {
+        HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
+        for (UsbDevice device : devices.values()) {
+            if (hasVideoInterface(device) && usbManager.hasPermission(device)) {
                 return device;
             }
         }

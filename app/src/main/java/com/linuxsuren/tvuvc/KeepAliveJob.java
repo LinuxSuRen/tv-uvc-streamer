@@ -15,6 +15,8 @@ import android.content.Intent;
 public class KeepAliveJob extends JobService {
 
     private static final int JOB_ID = 0x7101;
+    /** 一次性立即任务：进程内 startService 被定制 ROM 后台拒绝时借道 Job 白名单上下文 */
+    private static final int JOB_ID_IMMEDIATE = 0x7102;
 
     @Override
     public boolean onStartJob(JobParameters params) {
@@ -26,6 +28,23 @@ public class KeepAliveJob extends JobService {
     @Override
     public boolean onStopJob(JobParameters params) {
         return true; // 尽可能重新调度
+    }
+
+    /** 立即执行一次自愈检查（无约束、最多 2 秒后必须运行）：Job 上下文在系统临时白名单内，startService 不受后台限制（Max2.0 实测进程内重启被静默拒绝而 Job 路径放行） */
+    public static void scheduleImmediate(Context context) {
+        JobScheduler scheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+        if (scheduler == null) {
+            return;
+        }
+        JobInfo info = new JobInfo.Builder(JOB_ID_IMMEDIATE,
+                new ComponentName(context, KeepAliveJob.class))
+                .setMinimumLatency(0)
+                .setOverrideDeadline(2000)
+                .build();
+        try {
+            scheduler.schedule(info);
+        } catch (IllegalArgumentException ignored) {
+        }
     }
 
     /** 幂等调度：15 分钟周期 + 重启后保持（getPendingJob 需 API 24，用 cancel+schedule 兼容 API 23） */

@@ -36,11 +36,12 @@ public class AutoStartReceiver extends BroadcastReceiver {
             return;
         }
         UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
-        UsbDevice camera = StreamService.findCamera(usbManager);
-        if (camera != null && usbManager.hasPermission(camera)) {
+        // 多颗 USB 相机并存时迭代顺序不稳定：授权判定只认「已授权集合」
+        if (StreamService.findAuthorizedCamera(usbManager) != null) {
             startService(context);
             return;
         }
+        UsbDevice camera = StreamService.findCamera(usbManager);
         // 内置相机已授权即静默自启（仅开机事件），不再要求「无 USB 摄像头」：曾有一颗未授权
         // UVC 插着时整个开机自启被静默阻断（Max2.0 实测）。StreamService 本就优先内置路径，
         // USB 仅在内置全部失败后才回退。限定开机事件：USB_DEVICE_ATTACHED 在总线枚举时

@@ -70,6 +70,25 @@ static void frame_cb(uvc_frame_t *frame, void *user) {
     }
 }
 
+/* 协商单档 MJPEG 格式并起流 */
+static uvc_error_t try_stream(int width, int height, int fps) {
+    LOGI("negotiating MJPEG %dx%d@%d", width, height, fps);
+    uvc_stream_ctrl_t ctrl;
+    uvc_error_t rc = uvc_get_stream_ctrl_format_size(g_devh, &ctrl,
+            UVC_FRAME_FORMAT_MJPEG, width, height, fps);
+    if (rc != UVC_SUCCESS) {
+        LOGE("format %dx%d@%d unavailable: %d", width, height, fps, rc);
+        return rc;
+    }
+    g_streaming = 1;
+    rc = uvc_start_streaming(g_devh, &ctrl, frame_cb, NULL, 0);
+    if (rc != UVC_SUCCESS) {
+        g_streaming = 0;
+        LOGE("uvc_start_streaming %dx%d@%d failed: %d", width, height, fps, rc);
+    }
+    return rc;
+}
+
 /* 打开并启动一次流；失败时调用方负责 close_all 清理 */
 static uvc_error_t open_and_stream(int fd, int width, int height, int fps) {
     uvc_error_t rc = uvc_wrap(fd, g_ctx, &g_devh);
@@ -77,24 +96,23 @@ static uvc_error_t open_and_stream(int fd, int width, int height, int fps) {
         LOGE("uvc_wrap(fd=%d) failed: %d", fd, rc);
         return rc;
     }
-    LOGI("uvc_wrap ok, negotiating MJPEG %dx%d@%d", width, height, fps);
-
-    uvc_stream_ctrl_t ctrl;
-    rc = uvc_get_stream_ctrl_format_size(g_devh, &ctrl, UVC_FRAME_FORMAT_MJPEG,
-                                         width, height, fps);
-    if (rc != UVC_SUCCESS) {
-        LOGE("negotiate format failed: %d", rc);
-        return rc;
+    /* 相机对 MJPEG 分辨率/帧率组合支持不一（HIK 720P 实测不吃 1280x720@25，
+     * libuvc 返回 -51 NOT_SUPPORTED）：请求档优先，按常见档位逐档回退 */
+    static const int ladder[][3] = {
+        {1280, 720, 30}, {1280, 720, 25}, {960, 540, 30}, {640, 480, 30},
+        {640, 480, 25}, {640, 360, 30}, {320, 240, 30},
+    };
+    rc = try_stream(width, height, fps);
+    for (int i = 0; rc != UVC_SUCCESS && i < (int) (sizeof(ladder) / sizeof(ladder[0])); i++) {
+        if (ladder[i][0] == width && ladder[i][1] == height && ladder[i][2] == fps) {
+            continue; // 与请求档重复，已试过
+        }
+        rc = try_stream(ladder[i][0], ladder[i][1], ladder[i][2]);
     }
-    g_streaming = 1;
-    rc = uvc_start_streaming(g_devh, &ctrl, frame_cb, NULL, 0);
-    if (rc != UVC_SUCCESS) {
-        g_streaming = 0;
-        LOGE("uvc_start_streaming failed: %d", rc);
-        return rc;
+    if (rc == UVC_SUCCESS) {
+        LOGI("streaming started");
     }
-    LOGI("streaming started");
-    return UVC_SUCCESS;
+    return rc;
 }
 
 static void close_all(void) {

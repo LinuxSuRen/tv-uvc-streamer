@@ -444,12 +444,17 @@ public final class BuiltInCamera {
 
                 @Override
                 public void onDisconnected(CameraDevice device) {
+                    // 与 onConfigureFailed/异常路径对齐：不递减 pending 的话
+                    // checkAllFailed 永远差一步，唯一相机的重开失败无法立即
+                    // 升级 fullRestart，只能等 3 轮 heal（约 50 秒，Max2.0 实测）
+                    pending.decrementAndGet();
                     healFailed(cam, pending, streamingCount);
                 }
 
                 @Override
                 public void onError(CameraDevice device, int error) {
                     android.util.Log.e(TAG, "reopen camera " + cam.index + " error: " + error);
+                    pending.decrementAndGet();
                     healFailed(cam, pending, streamingCount);
                 }
             }, handler);
