@@ -40,10 +40,18 @@ public class StreamService extends Service {
     private static final int WANT_FPS = 25;
     private static final String CHANNEL_ID = "tvuvc-stream";
     private static final int NOTIFICATION_ID = 1;
+    /** 相机打开可能被卡死的 HAL 无限期挂起（Max2.0 重开悬置双 client、OPPO connectHelper 挂起均实测），超时放行 starting 允许下轮启动 */
+    private static final long STARTING_TIMEOUT_MS = 90_000;
+    /** 内置相机全部失败后的退避重试：开机阶段相机 HAL 可能尚未就绪，立即放弃会白白等 15 分钟 JobScheduler */
+    private static final int MAX_BUILTIN_RETRIES = 3;
+    private static final long BUILTIN_RETRY_DELAY_MS = 10_000;
 
     private boolean running;
     /** 启动流水线进行中标志：相机打开/回退是异步的，防止并发重复启动（KeepAliveJob 与界面同时拉起时实测会并发打开两次相机/争抢 UVC 上下文） */
     private final AtomicBoolean starting = new AtomicBoolean();
+    private volatile long startingSince;
+    private int builtinRetries;
+    private final android.os.Handler retryHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private UsbDeviceConnection connection;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
@@ -80,9 +88,21 @@ public class StreamService extends Service {
             starting.set(false);
             BuiltInCamera.stop();
         }
+        // 解卡：相机打开/回退全程无回调时 starting 会永久为真（HAL 挂起实测），
+        // 后续所有 startService 都会被它挡掉——服务活着却永远起不了管线
+        if (starting.get()
+                && android.os.SystemClock.elapsedRealtime() - startingSince > STARTING_TIMEOUT_MS) {
+            android.util.Log.w("tv-uvc-streamer", "camera start hung, releasing starting flag");
+            starting.set(false);
+            if (!running) {
+                // 清掉挂起尝试的残留（旧采集线程与半开的会话条目），避免脏状态叠加
+                BuiltInCamera.stop();
+            }
+        }
         if (running || !starting.compareAndSet(false, true)) {
             return START_STICKY;
         }
+        startingSince = android.os.SystemClock.elapsedRealtime();
         // 优先内置摄像头（Camera2 系统路径，避开定制设备上的原生层异常）；
         // 无内置、未授权或启动失败时回退 USB UVC（电视场景）。
         // openCamera 的 connect binder 调用可能被卡死的相机 HAL 无限期阻塞
@@ -111,12 +131,13 @@ public class StreamService extends Service {
                         () -> {
                             running = true;
                             starting.set(false);
+                            builtinRetries = 0;
                             acquireLocks();
                         },
-                        () -> startFromUsb());
+                        () -> builtinAllFailed());
                 if (!accepted) {
                     if (!running) {
-                        startFromUsb();
+                        builtinAllFailed();
                     } else {
                         starting.set(false);
                     }
@@ -167,6 +188,36 @@ public class StreamService extends Service {
             starting.set(false);
             stopSelf();
         }, "uvc-start").start();
+    }
+
+    /**
+     * 内置相机全部失败的处理：开机阶段相机 HAL 可能尚未就绪（或被特权应用暂时
+     * 占满），短退避重试几轮再回退 USB；曾经「一次失败立即放弃」，开机自启只能
+     * 干等 15 分钟 JobScheduler 周期。多路相机失败回调可能并发，靠 starting 的
+     * CAS 保证只处理一次。
+     */
+    private void builtinAllFailed() {
+        if (!starting.compareAndSet(true, false)) {
+            return;
+        }
+        if (builtinRetries < MAX_BUILTIN_RETRIES
+                && BuiltInCamera.hasCamera(this)
+                && checkSelfPermission(android.Manifest.permission.CAMERA)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            builtinRetries++;
+            android.util.Log.w("tv-uvc-streamer", "builtin cameras all failed, retry "
+                    + builtinRetries + "/" + MAX_BUILTIN_RETRIES
+                    + " in " + (BUILTIN_RETRY_DELAY_MS / 1000) + "s");
+            retryHandler.postDelayed(this::retryBuiltinStart, BUILTIN_RETRY_DELAY_MS);
+            return;
+        }
+        builtinRetries = 0;
+        startFromUsb();
+    }
+
+    /** 退避重试入口：走服务标准启动路径（含前台提升与自愈任务重排） */
+    private void retryBuiltinStart() {
+        StreamService.restartPipeline(StreamService.this);
     }
 
     /**
@@ -266,15 +317,18 @@ public class StreamService extends Service {
 
     @Override
     public void onDestroy() {
-        if (running) {
-            running = false;
-            starting.set(false);
-            BuiltInCamera.stop();
-            OnvifServer.stop();
-            RtspServer.stop();
-            MjpegServer.stop();
-            UvcCapture.nativeStop();
-        }
+        // 无条件回收全部组件：曾经仅在 running 时才停服务器，相机全灭路径
+        // （stopSelf 于 running=false）会把 HTTP/RTSP/ONVIF 留成僵尸——端口还在
+        // 应答却无流可推，ONVIF 只剩兜底假 Profile，自愈任务也被 socket 存活
+        // 假象骗过而不重启（Max2.0 实测）。各 stop 均可安全重入
+        retryHandler.removeCallbacksAndMessages(null);
+        running = false;
+        starting.set(false);
+        BuiltInCamera.stop();
+        OnvifServer.stop();
+        RtspServer.stop();
+        MjpegServer.stop();
+        UvcCapture.nativeStop();
         releaseLocks();
         if (connection != null) {
             connection.close();

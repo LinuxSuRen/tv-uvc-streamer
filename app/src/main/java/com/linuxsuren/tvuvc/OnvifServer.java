@@ -342,8 +342,10 @@ public final class OnvifServer {
             // Name 体现相机名（前置/后置/外接）；编号直接取注册表，避免位置错位
             java.util.Map<Integer, String> cams = new java.util.TreeMap<>(MjpegServer.cameras());
             if (cams.isEmpty()) {
-                // UVC USB 摄像头 / 相机未就绪场景：单 Profile
-                return soapBody(profileXml(1, "USB 摄像头"));
+                // 「只广播真实在推流的相机」：无相机在推流时返回空列表。
+                // 曾经兜底一个假 Profile，客户端拿到取流地址却无流可取，
+                // 被误报成"摄像头未返回任何媒体配置"（Max2.0 实测）
+                return soapBody("<trt:GetProfilesResponse/>");
             }
             StringBuilder sb = new StringBuilder("<trt:GetProfilesResponse>");
             for (Map.Entry<Integer, String> e : cams.entrySet()) {

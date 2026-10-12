@@ -117,11 +117,14 @@ public final class MjpegServer {
     }
 
     public static synchronized void start() throws IOException {
-        if (acceptThread != null && acceptThread.isAlive()) {
+        if (serverSocket != null && !serverSocket.isClosed()) {
             return;
         }
         // accept 线程持局部引用：stop() 将静态字段置 null 时不会读到半空状态（实测 NPE 崩溃）
-        final ServerSocket socket = new ServerSocket(PORT);
+        // SO_REUSEADDR：看门狗整体重启时 stop/start 快速循环，端口可能处于 TIME_WAIT
+        final ServerSocket socket = new ServerSocket();
+        socket.setReuseAddress(true);
+        socket.bind(new java.net.InetSocketAddress(PORT));
         serverSocket = socket;
         acceptThread = new Thread(() -> {
             while (!socket.isClosed()) {
@@ -193,14 +196,22 @@ public final class MjpegServer {
         }
     }
 
-    /** 供自愈任务调用：服务未运行时直接拉起采集服务。 */
+    /** 供自愈任务调用：服务器未运行时拉起采集服务；僵尸态（服务器活着但无相机在推流）时重建管线。 */
     public static void ensureRunning(Context context) {
-        if (serverSocket == null) {
-            try {
+        boolean serverDown = serverSocket == null || serverSocket.isClosed();
+        if (!serverDown && !cameras().isEmpty()) {
+            return; // 服务器与推流都正常
+        }
+        try {
+            if (serverDown) {
                 StreamService.start(context);
-            } catch (IllegalStateException ignored) {
-                // 极端后台限制场景；下个周期会重试
+            } else {
+                // 曾经只看 socket 存在与否：相机全灭后服务 stopSelf、服务器残留的
+                // 僵尸态永远检测不到，ONVIF 一直对外广播无流的假 Profile（实测）
+                StreamService.restartPipeline(context);
             }
+        } catch (IllegalStateException ignored) {
+            // 极端后台限制场景；下个周期会重试
         }
     }
 
