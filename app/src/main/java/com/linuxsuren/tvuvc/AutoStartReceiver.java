@@ -21,6 +21,10 @@ import android.hardware.usb.UsbManager;
  */
 public class AutoStartReceiver extends BroadcastReceiver {
 
+    /** 广播拉起服务的最小间隔：USB 总线枚举/设备抖动会产生成串广播（实测单次开机 251 次 startService），进程级节流 */
+    private static final long START_THROTTLE_MS = 30_000;
+    private static long lastStartAt;
+
     @Override
     public void onReceive(Context context, Intent intent) {
         String action = intent.getAction();
@@ -37,10 +41,12 @@ public class AutoStartReceiver extends BroadcastReceiver {
             startService(context);
             return;
         }
-        // 内置相机已授权即静默自启，不再要求「无 USB 摄像头」：曾有一颗未授权
-        // UVC 插着时整个开机自启被静默阻断（Max2.0 实测）。StreamService 本就
-        // 优先内置路径，USB 仅在内置全部失败后才回退
-        if (BuiltInCamera.hasCamera(context)
+        // 内置相机已授权即静默自启（仅开机事件），不再要求「无 USB 摄像头」：曾有一颗未授权
+        // UVC 插着时整个开机自启被静默阻断（Max2.0 实测）。StreamService 本就优先内置路径，
+        // USB 仅在内置全部失败后才回退。限定开机事件：USB_DEVICE_ATTACHED 在总线枚举时
+        // 会成串到达（WiFi/触摸模块逐个上线，实测 1 秒 12 次），不应每条都拉起服务
+        if (boot
+                && BuiltInCamera.hasCamera(context)
                 && context.checkSelfPermission(android.Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
             startService(context);
@@ -56,6 +62,11 @@ public class AutoStartReceiver extends BroadcastReceiver {
     }
 
     private void startService(Context context) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastStartAt < START_THROTTLE_MS) {
+            return; // 30 秒内已拉起过：交给服务自身的退避与自愈机制
+        }
+        lastStartAt = now;
         try {
             StreamService.start(context);
         } catch (IllegalStateException ignored) {

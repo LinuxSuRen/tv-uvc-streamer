@@ -45,12 +45,18 @@ public class StreamService extends Service {
     /** 内置相机全部失败后的退避重试：开机阶段相机 HAL 可能尚未就绪，立即放弃会白白等 15 分钟 JobScheduler */
     private static final int MAX_BUILTIN_RETRIES = 3;
     private static final long BUILTIN_RETRY_DELAY_MS = 10_000;
+    /** 失败纪元：超过该时长无新失败则重置重试计数 */
+    private static final long BUILTIN_FAILURE_EPOCH_MS = 5 * 60_000;
 
     private boolean running;
     /** 启动流水线进行中标志：相机打开/回退是异步的，防止并发重复启动（KeepAliveJob 与界面同时拉起时实测会并发打开两次相机/争抢 UVC 上下文） */
     private final AtomicBoolean starting = new AtomicBoolean();
     private volatile long startingSince;
-    private int builtinRetries;
+    /** 进程级失败簿记：AMS 重建服务会重置实例字段，开机广播风暴的连环拉起会瞬间烧光重试次数（实测 1 秒 12 次） */
+    private static long lastBuiltinFailureAt;
+    private static int builtinFailures;
+    /** 已排定退避重试：风暴回声的连环拉起不应把它 stopSelf 取消（曾互相取消致重试永不执行） */
+    private final AtomicBoolean retryScheduled = new AtomicBoolean();
     private final android.os.Handler retryHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private UsbDeviceConnection connection;
     private PowerManager.WakeLock wakeLock;
@@ -62,10 +68,11 @@ public class StreamService extends Service {
             if (!UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction()) || !running) {
                 return;
             }
-            // 只有正在采集的摄像头（视频类设备）被拔出才停止；
-            // 部分整机将 WiFi 等模块内挂在 USB 总线上，其重枚举广播不应中断推流
+            // 只有正在采集的 UVC 摄像头被拔出才停止（connection 非空 = UVC 路径在用）；
+            // 内置相机推流时，无关的视频类 USB 设备拔插（含成串重枚举）不应中断推流；
+            // 部分整机将 WiFi 等模块内挂在 USB 总线上，其重枚举广播同样不应中断
             UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-            if (device == null || hasVideoInterface(device)) {
+            if (connection != null && (device == null || hasVideoInterface(device))) {
                 stopSelf();
             }
         }
@@ -131,7 +138,8 @@ public class StreamService extends Service {
                         () -> {
                             running = true;
                             starting.set(false);
-                            builtinRetries = 0;
+                            builtinFailures = 0;
+                            lastBuiltinFailureAt = 0;
                             acquireLocks();
                         },
                         () -> builtinAllFailed());
@@ -194,29 +202,49 @@ public class StreamService extends Service {
      * 内置相机全部失败的处理：开机阶段相机 HAL 可能尚未就绪（或被特权应用暂时
      * 占满），短退避重试几轮再回退 USB；曾经「一次失败立即放弃」，开机自启只能
      * 干等 15 分钟 JobScheduler 周期。多路相机失败回调可能并发，靠 starting 的
-     * CAS 保证只处理一次。
+     * CAS 保证单次尝试只处理一次。
+     * <p>
+     * 时间闸门：开机时 USB 总线枚举风暴（WiFi/触摸模块逐个上线）会产生连环
+     * startService，每次都是独立相机尝试——间隔不足退避时长的失败视为风暴
+     * 回声，静默退出交给 JobScheduler 周期，不叠加重试（实测 1 秒内 12 次拉起）。
      */
     private void builtinAllFailed() {
         if (!starting.compareAndSet(true, false)) {
             return;
         }
-        if (builtinRetries < MAX_BUILTIN_RETRIES
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastBuiltinFailureAt > BUILTIN_FAILURE_EPOCH_MS) {
+            builtinFailures = 0; // 上一轮失败已冷却：重新给满重试机会
+        }
+        boolean storm = now - lastBuiltinFailureAt < BUILTIN_RETRY_DELAY_MS;
+        lastBuiltinFailureAt = now;
+        if (!storm
+                && builtinFailures < MAX_BUILTIN_RETRIES
                 && BuiltInCamera.hasCamera(this)
                 && checkSelfPermission(android.Manifest.permission.CAMERA)
                 == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            builtinRetries++;
+            builtinFailures++;
             android.util.Log.w("tv-uvc-streamer", "builtin cameras all failed, retry "
-                    + builtinRetries + "/" + MAX_BUILTIN_RETRIES
+                    + builtinFailures + "/" + MAX_BUILTIN_RETRIES
                     + " in " + (BUILTIN_RETRY_DELAY_MS / 1000) + "s");
+            retryScheduled.set(true);
             retryHandler.postDelayed(this::retryBuiltinStart, BUILTIN_RETRY_DELAY_MS);
             return;
         }
-        builtinRetries = 0;
+        if (storm) {
+            if (retryScheduled.get()) {
+                return; // 重试已在途：保持服务存活等它，风暴回声不叠加动作
+            }
+            android.util.Log.w("tv-uvc-streamer", "builtin cameras failed again too soon, backing off to JobScheduler");
+            startFromUsb();
+            return;
+        }
         startFromUsb();
     }
 
     /** 退避重试入口：走服务标准启动路径（含前台提升与自愈任务重排） */
     private void retryBuiltinStart() {
+        retryScheduled.set(false);
         StreamService.restartPipeline(StreamService.this);
     }
 
