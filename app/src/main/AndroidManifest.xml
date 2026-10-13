@@ -41,6 +41,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".AuthSettingsActivity"
+            android:exported="false"
+            android:label="@string/auth_title" />
+
         <service
             android:name=".StreamService"
             android:exported="false"

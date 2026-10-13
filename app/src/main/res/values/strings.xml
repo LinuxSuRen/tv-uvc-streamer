@@ -4,4 +4,15 @@
     <string name="foreground_channel">推流服务</string>
     <string name="foreground_title">摄像头推流中</string>
     <string name="btn_stop_exit">停止推流并退出</string>
+    <string name="auth_settings_btn">访问认证设置…</string>
+    <string name="auth_title">访问认证</string>
+    <string name="auth_scope_desc">RTSP(:8554) / HTTP(:8090) / ONVIF(:8000) 三服务共用同一账号；默认关闭，开启后立即生效</string>
+    <string name="auth_switch_label">启用访问认证</string>
+    <string name="auth_user_hint">用户名</string>
+    <string name="auth_pass_hint">密码</string>
+    <string name="auth_show_password">显示密码</string>
+    <string name="auth_save">保存并生效</string>
+    <string name="auth_saved_on">认证已开启（账号 %1$s）</string>
+    <string name="auth_saved_off">认证已关闭</string>
+    <string name="auth_hint">拉流地址形如 rtsp://用户名:密码@设备IP:8554/cam；口令仅存本机私有目录（摘要校验需明文参与），建议用户名密码用 ASCII</string>
 </resources>
