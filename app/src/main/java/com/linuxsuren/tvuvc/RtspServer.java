@@ -37,11 +37,14 @@ public final class RtspServer {
     }
 
     public static synchronized void start() throws IOException {
-        if (acceptThread != null && acceptThread.isAlive()) {
+        if (serverSocket != null && !serverSocket.isClosed()) {
             return;
         }
         // accept 线程持局部引用：stop() 将静态字段置 null 时不会读到半空状态（实测 NPE 崩溃）
-        final ServerSocket socket = new ServerSocket(PORT);
+        // SO_REUSEADDR：看门狗整体重启时 stop/start 快速循环，端口可能处于 TIME_WAIT
+        final ServerSocket socket = new ServerSocket();
+        socket.setReuseAddress(true);
+        socket.bind(new java.net.InetSocketAddress(PORT));
         serverSocket = socket;
         acceptThread = new Thread(() -> {
             while (!socket.isClosed()) {

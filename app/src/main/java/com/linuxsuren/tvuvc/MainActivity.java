@@ -134,27 +134,31 @@ public class MainActivity extends Activity {
             return;
         }
         // 内置相机授权与是否插着 USB 相机无关（部分整机内挂 USB 摄像头，
-        // 曾因此每次启动都被误导向 USB 授权弹框）；服务端本就优先内置路径
-        boolean usbReady = camera != null && usbManager.hasPermission(camera);
+        // 曾因此每次启动都被误导向 USB 授权弹框）；服务端本就优先内置路径。
+        // 多颗 USB 相机并存时迭代顺序不稳定，就绪判定只认已授权集合
+        boolean usbReady = StreamService.findAuthorizedCamera(usbManager) != null;
         boolean builtinReady = hasBuiltin
                 && checkSelfPermission(android.Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED;
+        // 未授权的 USB 摄像头：请求设备授权，即使内置相机可用（授权无害，
+        // 且内置被特权应用抢占的设备上 UVC 是唯一可用来源，Max2.0 实测）。
+        // 授权结果由广播接收器处理；此前该请求被「内置已就绪」短路，
+        // 这类设备上的 UVC 永远无法启用。多颗未授权相机逐轮弹窗（一次仅一框）
+        if (camera != null && !usbManager.hasPermission(camera)) {
+            PendingIntent pi = PendingIntent.getBroadcast(this, 0,
+                    new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName()),
+                    PendingIntent.FLAG_IMMUTABLE);
+            usbManager.requestPermission(camera, pi);
+            renderStatus("等待 USB 摄像头授权…");
+        }
         if (usbReady || builtinReady || serviceStarted) {
             startStreamService();
             return;
         }
         if (hasBuiltin) {
-            // 内置相机在但未授权：优先走 CAMERA 运行时授权
+            // 内置相机在但未授权：走 CAMERA 运行时授权
             requestPermissions(new String[]{android.Manifest.permission.CAMERA}, REQ_CAMERA);
             renderStatus("等待相机授权…");
-            return;
-        }
-        if (camera != null) {
-            PendingIntent pi = PendingIntent.getBroadcast(this, 0,
-                    new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName()),
-                    PendingIntent.FLAG_IMMUTABLE);
-            usbManager.requestPermission(camera, pi);
-            renderStatus("等待 USB 授权确认…");
         }
     }
 
