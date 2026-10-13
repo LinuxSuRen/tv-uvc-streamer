@@ -47,11 +47,23 @@ public class KeepAliveJob extends JobService {
         try {
             scheduler.schedule(info);
         } catch (IllegalArgumentException ignored) {
+        } catch (IllegalStateException e) {
+            // 同 schedule()：限流静默降级，不允许异常上主线程
+            android.util.Log.w("tv-uvc-streamer", "immediate job schedule rate-limited");
         }
     }
 
+    /** schedule 节流窗口：onStartCommand 风暴时避免烧 JobScheduler 250 次/60s 配额 */
+    private static final long SCHEDULE_THROTTLE_MS = 5_000;
+    private static long lastScheduleAt;
+
     /** 幂等调度：15 分钟周期 + 重启后保持（getPendingJob 需 API 24，用 cancel+schedule 兼容 API 23） */
     public static void schedule(Context context) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastScheduleAt < SCHEDULE_THROTTLE_MS) {
+            return; // 5 秒内已排过：15 分钟周期任务无需更密刷新，风暴轮次直接跳过
+        }
+        lastScheduleAt = now;
         JobScheduler scheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
         if (scheduler == null) {
             return;
@@ -67,6 +79,11 @@ public class KeepAliveJob extends JobService {
             scheduler.schedule(info);
         } catch (IllegalArgumentException ignored) {
             // 极少数 ROM 不支持 persisted 任务
+        } catch (IllegalStateException e) {
+            // JobScheduler 250 次/60s 限流：startService 风暴下每轮 onStartCommand 都
+            // cancel+schedule 会烧穿配额（联想 TB335ZC/Android 16 实测 14s 后 FATAL
+            // 炸主线程）。限流是暂时态，静默降级等下一轮重排，绝不让异常上主线程
+            android.util.Log.w("tv-uvc-streamer", "job schedule rate-limited, skip this round");
         }
     }
 
