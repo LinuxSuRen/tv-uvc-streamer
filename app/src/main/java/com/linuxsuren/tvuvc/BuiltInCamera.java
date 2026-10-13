@@ -509,7 +509,9 @@ public final class BuiltInCamera {
     /**
      * 按当前设备姿态重建重复请求：JPEG_ORIENTATION 由 HAL 直接转正像素，
      * 快照/MJPEG/RTSP 各消费端无需感知 EXIF 方向。
-     * 前摄与后摄的换算方向相反（前摄镜像），映射以后摄 orientation=90 实测校准。
+     * 后摄以后摄 orientation=90 真机校准；前摄与后摄换算方向相反且历史上
+     * 仅按后摄外推、未经真机验证——联想 TB335ZC（竖屏原生面板、横屏使用）
+     * 实测画面上下颠倒，前摄分支补 180° 校正。
      */
     private static void applyRepeating(Cam cam) {
         CameraCaptureSession s = cam.session;
@@ -520,7 +522,7 @@ public final class BuiltInCamera {
             int suggest = orientation == null ? 90 : orientation.getSuggest();
             int display = displayRotationOf(suggest);
             int jpegOrientation = cam.facing == CameraCharacteristics.LENS_FACING_FRONT
-                    ? (cam.sensorOrientation + display) % 360
+                    ? (cam.sensorOrientation + display + 180) % 360
                     : (cam.sensorOrientation - display + 360) % 360;
             CaptureRequest.Builder builder = cam.device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
             builder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation);
