@@ -89,6 +89,13 @@ public class StreamService extends Service {
         promoteToForeground();
         KeepAliveJob.schedule(this);
         if (intent != null && intent.getBooleanExtra(EXTRA_RESTART_PIPELINE, false) && running) {
+            // UVC 正在推流：重启请求多半来自交接空窗期的僵尸误判（标签未及挂上），
+            // 不是真实故障——保持工作中的采集源，只补挂标签（重启风暴曾把刚
+            // 建立的 UVC 每 50ms 拆一次，播放端全程断流，Max2.0 实测）
+            if (connection != null) {
+                MjpegServer.registerCamera(0, "USB 摄像头");
+                return START_STICKY;
+            }
             // 管线重启：保留服务与服务器，仅重建采集（看门狗升级恢复路径）
             android.util.Log.w("tv-uvc-streamer", "restarting capture pipeline");
             running = false;

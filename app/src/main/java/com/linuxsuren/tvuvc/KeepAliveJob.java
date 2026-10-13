@@ -20,14 +20,17 @@ public class KeepAliveJob extends JobService {
 
     @Override
     public boolean onStartJob(JobParameters params) {
+        // ensureRunning 的重启动作只投递 startService，均同步完成：
+        // 必须返回 false。曾经「jobFinished + return true」的矛盾用法会让
+        // 一次性立即 Job 被 onStopJob 无限重排，形成重启风暴（Max2.0 实测）
         MjpegServer.ensureRunning(this);
-        jobFinished(params, false);
-        return true;
+        return false;
     }
 
     @Override
     public boolean onStopJob(JobParameters params) {
-        return true; // 尽可能重新调度
+        // 周期任务尽可能重新调度；一次性立即任务不重排（避免立即 Job 风暴）
+        return params.getJobId() != JOB_ID_IMMEDIATE;
     }
 
     /** 立即执行一次自愈检查（无约束、最多 2 秒后必须运行）：Job 上下文在系统临时白名单内，startService 不受后台限制（Max2.0 实测进程内重启被静默拒绝而 Job 路径放行） */
