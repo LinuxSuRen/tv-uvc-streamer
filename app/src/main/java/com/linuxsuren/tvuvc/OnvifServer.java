@@ -15,9 +15,12 @@ import java.net.MulticastSocket;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TimeZone;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -253,7 +256,16 @@ public final class OnvifServer {
         try {
             client.setSoTimeout(10000);
             String request = readRequest(client.getInputStream());
-            String response = handleSoap(request);
+            // PullPoint 订阅地址路由：/onvif/sub_N 上的请求按订阅操作分发
+            //（PullMessages 可能阻塞至 Timeout，应答前延长 socket 超时不必要——
+            // 阻塞发生在事件总线的条件等待，与读超时无关）
+            String subId = extract(request, "POST /onvif/(sub_[A-Za-z0-9]+)");
+            String response;
+            if (subId != null) {
+                response = handlePullPoint(subId, request);
+            } else {
+                response = handleSoap(request);
+            }
             OutputStream out = client.getOutputStream();
             if (response == null) {
                 // 认证拒绝：按 ONVIF 客户端兼容惯例回 HTTP 401（空体）
@@ -334,15 +346,38 @@ public final class OnvifServer {
     private static String handleSoap(String request) {
         String ip = MjpegServer.lanAddress();
         // 认证门禁：pre-auth 白名单（GetSystemDateAndTime 对时/GetCapabilities/GetServices
-        // 能力发现）放行，其余操作（GetProfiles/GetStreamUri/快照/设备信息）要求
-        // WS-Security UsernameToken；WS-Discovery 发现不设防
+        // 能力发现）放行，其余操作（GetProfiles/GetStreamUri/快照/设备信息/事件订阅）
+        // 要求 WS-Security UsernameToken；WS-Discovery 发现不设防
         if (Auth.isEnabled()
                 && !request.contains("GetSystemDateAndTime")
                 && !request.contains("GetCapabilities")
                 && !request.contains("GetServices")
                 && !Auth.verifyWsUsernameToken(request)) {
             android.util.Log.w("tv-uvc-onvif", "soap 401 unauthorized");
+            OnvifEventBus.publish("lns:Security/AuthFailure",
+                    new String[][]{{"Service", "ONVIF"}},
+                    new String[][]{{"State", "Failed"}});
             return null;
+        }
+        // ---- Event 服务（PullPoint 订阅模型）----
+        if (request.contains("CreatePullPointSubscription")) {
+            long ttl = parseIsoDuration(extract(request, "InitialTerminationTime>([^<]+)<"));
+            String id = OnvifEventBus.create(ttl);
+            return soapBodyEvents("<tev:CreatePullPointSubscriptionResponse>"
+                    + "<tev:SubscriptionReference><wsa:Address>"
+                    + subscriptionAddress(id) + "</wsa:Address></tev:SubscriptionReference>"
+                    + "<wsnt:CurrentTime>" + isoNow() + "</wsnt:CurrentTime>"
+                    + "<wsnt:TerminationTime>" + isoAfter(ttl > 0 ? ttl : OnvifEventBus.DEFAULT_TTL_MS) + "</wsnt:TerminationTime>"
+                    + "</tev:CreatePullPointSubscriptionResponse>");
+        }
+        if (request.contains("GetEventProperties")) {
+            return soapBodyEvents("<tev:GetEventPropertiesResponse>"
+                    + "<tev:TopicNamespaceLocation>http://www.onvif.org/onvif/ver10/topics/index.html</tev:TopicNamespaceLocation>"
+                    + "<wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>"
+                    + "<wsnt:TopicExpressionDialect>http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet</wsnt:TopicExpressionDialect>"
+                    + "<tev:MessageContentFilterDialect>http://www.onvif.org/ver10/tev/messageContentFilter/ItemFilter</tev:MessageContentFilterDialect>"
+                    + topicSet()
+                    + "</tev:GetEventPropertiesResponse>");
         }
         if (request.contains("GetSystemDateAndTime")) {
             return soapBody("<td:GetSystemDateAndTimeResponse>"
@@ -374,6 +409,7 @@ public final class OnvifServer {
                     + "<tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>"
                     + "<tt:NonAggregateControl>true</tt:NonAggregateControl>"
                     + "</tt:StreamingCapabilities></tt:Media>"
+                    + "<tt:Events><tt:XAddr>" + xAddrs() + "</tt:XAddr></tt:Events>"
                     + "</td:Capabilities></td:GetCapabilitiesResponse>");
         }
         if (request.contains("GetServices")) {
@@ -382,6 +418,9 @@ public final class OnvifServer {
                     + "<td:XAddr>" + xAddrs() + "</td:XAddr><td:Version><tt:Major>1</tt:Major><tt:Minor>0</tt:Minor></td:Version></td:Service>"
                     + "<td:Service><td:Namespace>http://www.onvif.org/ver10/media/wsdl</td:Namespace>"
                     + "<td:XAddr>http://" + ip + ":" + HTTP_PORT + "/onvif/media_service</td:XAddr>"
+                    + "<td:Version><tt:Major>1</tt:Major><tt:Minor>0</tt:Minor></td:Version></td:Service>"
+                    + "<td:Service><td:Namespace>http://www.onvif.org/ver10/events/wsdl</td:Namespace>"
+                    + "<td:XAddr>" + xAddrs() + "</td:XAddr>"
                     + "<td:Version><tt:Major>1</tt:Major><tt:Minor>0</tt:Minor></td:Version></td:Service>"
                     + "</td:GetServicesResponse>");
         }
@@ -466,6 +505,135 @@ public final class OnvifServer {
                 + " xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\""
                 + " xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
                 + "<s:Body>" + inner + "</s:Body></s:Envelope>";
+    }
+
+    // ---------------- Event 服务（PullPoint）----------------
+
+    /** PullPoint 订阅端点（/onvif/sub_N）的操作分发：Pull/Renew/Unsubscribe */
+    private static String handlePullPoint(String id, String request) {
+        // 订阅端点同样要求认证（开启时）——订阅操作不在 pre-auth 白名单
+        if (Auth.isEnabled() && !Auth.verifyWsUsernameToken(request)) {
+            OnvifEventBus.publish("lns:Security/AuthFailure",
+                    new String[][]{{"Service", "ONVIF"}},
+                    new String[][]{{"State", "Failed"}});
+            return null;
+        }
+        if (request.contains("PullMessages")) {
+            long waitMs = parseIsoDuration(extract(request, "Timeout>([^<]+)<"));
+            int limit = 10;
+            try {
+                String lim = extract(request, "MessageLimit>(\\d+)<");
+                if (lim != null) {
+                    limit = Integer.parseInt(lim);
+                }
+            } catch (NumberFormatException ignored) {
+            }
+            String messages;
+            try {
+                messages = OnvifEventBus.pull(id, waitMs, limit);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+            if (messages == null) {
+                return soapBodyEvents(soapFaultEvents("ter:SubscriptionLost",
+                        "subscription expired or unknown"));
+            }
+            return soapBodyEvents("<tev:PullMessagesResponse>"
+                    + "<tev:CurrentTime>" + isoNow() + "</tev:CurrentTime>"
+                    + "<tev:TerminationTime>" + isoAfter(OnvifEventBus.DEFAULT_TTL_MS) + "</tev:TerminationTime>"
+                    + messages
+                    + "</tev:PullMessagesResponse>");
+        }
+        if (request.contains("Renew")) {
+            long ttl = parseIsoDuration(extract(request, "TerminationTime>([^<]+)<"));
+            if (ttl < 0) {
+                ttl = OnvifEventBus.DEFAULT_TTL_MS;
+            }
+            if (!OnvifEventBus.renew(id, ttl)) {
+                return soapBodyEvents(soapFaultEvents("ter:SubscriptionLost",
+                        "subscription expired or unknown"));
+            }
+            return soapBodyEvents("<wsnt:RenewResponse>"
+                    + "<wsnt:TerminationTime>" + isoAfter(ttl) + "</wsnt:TerminationTime>"
+                    + "</wsnt:RenewResponse>");
+        }
+        if (request.contains("Unsubscribe")) {
+            OnvifEventBus.unsubscribe(id);
+            return soapBodyEvents("<wsnt:UnsubscribeResponse/>");
+        }
+        return soapBodyEvents(soapFaultEvents("ter:ActionNotSupported",
+                "operation not supported on pull point"));
+    }
+
+    private static String soapFaultEvents(String code, String text) {
+        return "<s:Fault><s:Code><s:Value>s:Sender</s:Value>"
+                + "<s:Subcode><s:Value>" + code + "</s:Value></s:Subcode></s:Code>"
+                + "<s:Reason><s:Text xml:lang=\"en\">" + text + "</s:Text></s:Reason></s:Fault>";
+    }
+
+    /** 支持的话题集（GetEventProperties），标准话题 tns1 + 自定义 lns */
+    private static String topicSet() {
+        return "<wstop:TopicSet>"
+                + "<wstop:VideoSource><wstop:SignalLoss wstop:topic=\"true\"/></wstop:VideoSource>"
+                + "<wstop:RuleEngine><wstop:CellMotion><wstop:Motion wstop:topic=\"true\"/></wstop:CellMotion></wstop:RuleEngine>"
+                + "<wstop:Security><wstop:AuthFailure wstop:topic=\"true\"/></wstop:Security>"
+                + "<wstop:Power><wstop:Battery wstop:topic=\"true\"/></wstop:Power>"
+                + "</wstop:TopicSet>";
+    }
+
+    private static String subscriptionAddress(String id) {
+        return "http://" + MjpegServer.lanAddress() + ":" + HTTP_PORT + "/onvif/" + id;
+    }
+
+    /** 事件应答信封：声明事件相关命名空间（tev/wsa/wsnt/wstop + 话题 tns1/lns） */
+    private static String soapBodyEvents(String inner) {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                + "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\""
+                + " xmlns:td=\"http://www.onvif.org/ver10/device/wsdl\""
+                + " xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\""
+                + " xmlns:tt=\"http://www.onvif.org/ver10/schema\""
+                + " xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\""
+                + " xmlns:wsa=\"http://www.w3.org/2005/08/addressing\""
+                + " xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\""
+                + " xmlns:wstop=\"http://docs.oasis-open.org/wsn/t-1\""
+                + " xmlns:tns1=\"http://www.onvif.org/ver10/topics\""
+                + " xmlns:lns=\"http://www.linuxsuren.com/onvif/topics\">"
+                + "<s:Body>" + inner + "</s:Body></s:Envelope>";
+    }
+
+    private static String isoNow() {
+        SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
+        f.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return f.format(new Date());
+    }
+
+    private static String isoAfter(long afterMs) {
+        SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
+        f.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return f.format(new Date(System.currentTimeMillis() + afterMs));
+    }
+
+    /** ISO 8601 时长（PT#H#M#S，含小数秒）转毫秒；无法解析返回 -1 */
+    private static long parseIsoDuration(String d) {
+        if (d == null) {
+            return -1;
+        }
+        Matcher m = Pattern.compile("(?i)^PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+(?:\\.\\d+)?)S)?$").matcher(d.trim());
+        if (!m.find()) {
+            return -1;
+        }
+        long ms = 0;
+        if (m.group(1) != null) {
+            ms += Long.parseLong(m.group(1)) * 3600_000L;
+        }
+        if (m.group(2) != null) {
+            ms += Long.parseLong(m.group(2)) * 60_000L;
+        }
+        if (m.group(3) != null) {
+            ms += (long) (Double.parseDouble(m.group(3)) * 1000);
+        }
+        return ms;
     }
 
     private static String extract(String text, String regex) {

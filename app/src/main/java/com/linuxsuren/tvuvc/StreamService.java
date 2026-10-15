@@ -89,6 +89,7 @@ public class StreamService extends Service {
         promoteToForeground();
         KeepAliveJob.schedule(this);
         applyAuthConfig();
+        startEventSources();
         if (intent != null && intent.getBooleanExtra(EXTRA_RESTART_PIPELINE, false) && running) {
             // UVC 正在推流：重启请求多半来自交接空窗期的僵尸误判（标签未及挂上），
             // 不是真实故障——保持工作中的采集源，只补挂标签（重启风暴曾把刚
@@ -306,6 +307,106 @@ public class StreamService extends Service {
         Auth.configure(prefs.getBoolean("auth_enabled", false),
                 prefs.getString("auth_user", ""),
                 prefs.getString("auth_pass", ""));
+    }
+
+    // ---------------- 事件源（ONVIF Event，PullPoint 模型）----------------
+
+    /** 静态存活：服务重启风暴下不重复注册（监听器幂等 + 定时器防重排） */
+    private static MotionDetector motionDetector;
+    private static boolean batteryScheduled;
+    private static int lastBatteryStatus = -1;
+    private static int lastBatteryLevel = -1;
+    private static boolean batteryTempHigh;
+    private static final int[] BATTERY_THRESHOLDS = {20, 10, 5};
+    private static final int BATTERY_TEMP_HIGH = 450; // 0.1°C
+
+    /** 运动检测 + 电池监控：进程生命周期内各起一份 */
+    private void startEventSources() {
+        if (motionDetector == null) {
+            motionDetector = MotionDetector.start();
+        }
+        if (batteryScheduled) {
+            return;
+        }
+        batteryScheduled = true;
+        android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
+        Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                if (!batteryScheduled) {
+                    return;
+                }
+                readBattery();
+                handler.postDelayed(this, 30_000);
+            }
+        };
+        handler.post(tick);
+    }
+
+    /** 电池状态变化才发事件（充电状态切换/电量跨阈值/温度跨 45°C），附电压数据 */
+    private void readBattery() {
+        try {
+            Intent i = registerReceiver(null, new android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if (i == null) {
+                return;
+            }
+            int level = i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
+            int scale = i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
+            int status = i.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1);
+            int temp = i.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1000); // 0.1°C
+            int voltage = i.getIntExtra(android.os.BatteryManager.EXTRA_VOLTAGE, -1);     // mV
+            if (level < 0) {
+                return;
+            }
+            int percent = level * 100 / Math.max(1, scale);
+            boolean changed = false;
+            if (lastBatteryStatus < 0) {
+                changed = true; // 首次上报基线
+            } else {
+                if (status != lastBatteryStatus) {
+                    changed = true;
+                }
+                for (int t : BATTERY_THRESHOLDS) {
+                    if ((lastBatteryLevel > t) != (percent > t)) {
+                        changed = true; // 跨越低电量阈值
+                    }
+                }
+                boolean high = temp >= BATTERY_TEMP_HIGH;
+                if (high != batteryTempHigh) {
+                    changed = true;
+                    batteryTempHigh = high;
+                }
+            }
+            lastBatteryStatus = status;
+            lastBatteryLevel = percent;
+            if (changed) {
+                OnvifEventBus.publish("lns:Power/Battery",
+                        new String[][]{{"Source", "Battery"}},
+                        new String[][]{
+                                {"Level", String.valueOf(percent)},
+                                {"Status", batteryStatusText(status)},
+                                {"Temp", temp > -1000 ? String.format(java.util.Locale.US, "%.1f", temp / 10.0) : "unknown"},
+                                {"Voltage", voltage > 0 ? String.valueOf(voltage) : "unknown"},
+                        });
+            }
+        } catch (Exception ignored) {
+            // 注册 receiver 极端失败：跳过本周期
+        }
+    }
+
+    private static String batteryStatusText(int status) {
+        switch (status) {
+            case android.os.BatteryManager.BATTERY_STATUS_CHARGING:
+                return "Charging";
+            case android.os.BatteryManager.BATTERY_STATUS_DISCHARGING:
+                return "Discharging";
+            case android.os.BatteryManager.BATTERY_STATUS_FULL:
+                return "Full";
+            case android.os.BatteryManager.BATTERY_STATUS_NOT_CHARGING:
+                return "NotCharging";
+            default:
+                return "Unknown";
+        }
     }
 
     /** 统一启动入口：所有机型走纯后台服务（targetSdk 23 豁免 API 26+ 后台限制） */
