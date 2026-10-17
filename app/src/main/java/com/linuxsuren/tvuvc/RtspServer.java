@@ -131,6 +131,9 @@ public final class RtspServer {
                 if (Auth.isEnabled() && !"OPTIONS".equals(method)) {
                     if (!Auth.verifyRtsp(method, authorization, authNonce)) {
                         authNonce = Auth.randomNonce();
+                        OnvifEventBus.publish("lns:Security/AuthFailure",
+                                new String[][]{{"Service", "RTSP"}},
+                                new String[][]{{"State", "Failed"}});
                         write(out, "RTSP/1.0 401 Unauthorized\r\nCSeq: " + cseq
                                 + "\r\nWWW-Authenticate: Digest realm=\"" + Auth.REALM
                                 + "\", nonce=\"" + authNonce + "\", algorithm=MD5"

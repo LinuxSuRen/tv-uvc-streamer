@@ -73,18 +73,34 @@ public final class MjpegServer {
     /** 采集层注册摄像头（会话建立后调用），供状态页与 ONVIF 枚举 */
     public static void registerCamera(int camera, String label) {
         synchronized (LOCK) {
+            boolean recovered = !LABELS.containsKey(camera);
             LABELS.put(camera, label == null ? ("camera " + camera) : label);
+            if (recovered) {
+                // 信号恢复：tns1:VideoSource/SignalLoss State=false（相机从无到有，
+                // 覆盖开机首帧、相机被驱逐后自愈、管线重启等全部路径）
+                OnvifEventBus.publish("tns1:VideoSource/SignalLoss",
+                        new String[][]{{"Source", "Camera_" + camera}},
+                        new String[][]{{"State", "false"}});
+            }
         }
     }
 
     /** 相机关闭（切换/停止）时反注册：ONVIF 只应广播真实在推流的相机，陈旧帧一并清理 */
     public static void unregisterCamera(int camera) {
         synchronized (LOCK) {
+            boolean lost = LABELS.containsKey(camera);
             LABELS.remove(camera);
             LATEST.remove(camera);
             COUNTS.remove(camera);
             FPS_WINDOW.remove(camera);
             FPS.remove(camera);
+            if (lost) {
+                // 信号丢失：tns1:VideoSource/SignalLoss State=true（HAL 卡死/驱逐/
+                // 管线重启清场，NVR 据此区分「相机挂了」与「网络挂了」）
+                OnvifEventBus.publish("tns1:VideoSource/SignalLoss",
+                        new String[][]{{"Source", "Camera_" + camera}},
+                        new String[][]{{"State", "true"}});
+            }
         }
     }
 
@@ -245,6 +261,9 @@ public final class MjpegServer {
             // 认证门禁：开启后所有路径（状态页/快照/MJPEG）要求 HTTP Basic，
             // 浏览器原生弹登录框；放在路由分发前，401 不泄露路由信息
             if (Auth.isEnabled() && !Auth.verifyHttpBasic(headerValue(head, "Authorization"))) {
+                OnvifEventBus.publish("lns:Security/AuthFailure",
+                        new String[][]{{"Service", "HTTP"}},
+                        new String[][]{{"State", "Failed"}});
                 out.write(("HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"" + Auth.REALM
                         + "\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .getBytes(StandardCharsets.US_ASCII));
