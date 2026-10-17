@@ -77,7 +77,13 @@ public final class RtspServer {
     }
 
     static String url() {
-        return String.format(Locale.US, "rtsp://%s:%d/cam", MjpegServer.lanAddress(), PORT);
+        return urlOf(0);
+    }
+
+    /** 指定摄像头的 RTSP 地址（0 号保持 /cam 兼容路径，其余为 /camN） */
+    static String urlOf(int camera) {
+        return String.format(Locale.US, "rtsp://%s:%d/%s", MjpegServer.lanAddress(), PORT,
+                camera <= 0 ? "cam" : "cam" + camera);
     }
 
     // ---------------- RTSP 会话 ----------------
@@ -143,7 +149,7 @@ public final class RtspServer {
                     case "DESCRIBE":
                         write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                 + "\r\nContent-Type: application/sdp\r\nContent-Length: "
-                                + sdp().length() + "\r\n\r\n" + sdp());
+                                + sdp(camera).length() + "\r\n\r\n" + sdp(camera));
                         break;
                     case "SETUP":
                         session = Integer.toHexString(new Random().nextInt(0x7FFFFFFF));
@@ -166,13 +172,13 @@ public final class RtspServer {
                             synchronized (client.lock) {
                                 write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                         + "\r\nSession: " + session
-                                        + "\r\nRTP-Info: url=" + url() + ";seq=0;rtptime=0"
+                                        + "\r\nRTP-Info: url=" + urlOf(client.camera) + ";seq=0;rtptime=0"
                                         + "\r\nRange: npt=0-\r\n\r\n");
                             }
                         } else {
                             write(out, "RTSP/1.0 200 OK\r\nCSeq: " + cseq
                                     + "\r\nSession: " + session
-                                    + "\r\nRTP-Info: url=" + url() + ";seq=0;rtptime=0"
+                                    + "\r\nRTP-Info: url=" + urlOf(camera) + ";seq=0;rtptime=0"
                                     + "\r\nRange: npt=0-\r\n\r\n");
                         }
                         break;
@@ -198,13 +204,15 @@ public final class RtspServer {
         }
     }
 
-    private static String sdp() {
+    /** SDP：control 地址必须跟随请求的相机（多摄设备 ffmpeg 按 SDP control 发 SETUP，
+     * 硬编码 /cam 会把 /camN 客户端引到 0 号相机，表现为拉流永远等不到数据） */
+    private static String sdp(int camera) {
         return "v=0\r\n"
                 + "o=- 0 0 IN IP4 " + MjpegServer.lanAddress() + "\r\n"
                 + "s=tv-uvc-streamer\r\n"
                 + "m=video 0 RTP/AVP " + PAYLOAD_TYPE + "\r\n"
                 + "c=IN IP4 0.0.0.0\r\n"
-                + "a=control:" + url() + "\r\n"
+                + "a=control:" + urlOf(camera) + "\r\n"
                 + "a=rtpmap:" + PAYLOAD_TYPE + " JPEG/90000\r\n"
                 + "a=framerate:25\r\n";
     }

@@ -12,8 +12,8 @@ android {
         applicationId "com.linuxsuren.tvuvc"
         minSdk 23
         targetSdk 24
-        versionCode 7
-        versionName "0.5.1"
+        versionCode 8
+        versionName "0.6.0"
 
         externalNativeBuild {
             cmake {

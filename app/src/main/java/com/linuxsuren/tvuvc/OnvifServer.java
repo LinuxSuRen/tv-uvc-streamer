@@ -257,8 +257,6 @@ public final class OnvifServer {
             client.setSoTimeout(10000);
             String request = readRequest(client.getInputStream());
             // PullPoint 订阅地址路由：/onvif/sub_N 上的请求按订阅操作分发
-            //（PullMessages 可能阻塞至 Timeout，应答前延长 socket 超时不必要——
-            // 阻塞发生在事件总线的条件等待，与读超时无关）
             String subId = extract(request, "POST /onvif/(sub_[A-Za-z0-9]+)");
             String response;
             if (subId != null) {

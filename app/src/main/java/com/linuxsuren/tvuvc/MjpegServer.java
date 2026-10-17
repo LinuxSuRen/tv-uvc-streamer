@@ -403,13 +403,13 @@ public final class MjpegServer {
                 .append("<p>auth: ").append(Auth.isEnabled()
                         ? "on (" + Auth.getUser() + ")" : "off").append("</p>");
         if (cams.isEmpty()) {
-            body.append("<p>frames: ").append(totalFrames).append("</p>");
+            body.append("<p>waiting for camera…</p>");
         }
         for (Map.Entry<Integer, String> e : cams.entrySet()) {
             int cam = e.getKey();
             String suffix = cam == 0 ? "" : "?cam=" + cam;
             body.append("<h3>").append(e.getValue()).append(" (camera ").append(cam).append(")</h3>")
-                    .append("<p>fps: ").append(fps(cam)).append(" · frames: ").append(frameCount(cam)).append("</p>")
+                    .append("<p>fps: ").append(fps(cam)).append("</p>")
                     .append("<p><a style='color:#8cf' href='http://").append(ip).append(':').append(PORT)
                     .append("/stream").append(suffix).append("'>/stream").append(suffix).append("</a>")
                     .append(" · <a style='color:#8cf' href='http://").append(ip).append(':').append(PORT)

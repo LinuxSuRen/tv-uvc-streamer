@@ -196,7 +196,7 @@ public class MainActivity extends Activity {
         renderStatus();
     }
 
-    /** 运行状态页：设备信息 + 推流地址 + 实时帧计数（每秒刷新） */
+    /** 运行状态页：设备信息 + 推流地址 + 实时帧率（每秒刷新） */
     private void renderStatus() {
         renderStatus(null);
     }
@@ -219,10 +219,7 @@ public class MainActivity extends Activity {
             if (lastFrames >= 0 && frames >= lastFrames && lastTick > 0) {
                 long elapsed = System.currentTimeMillis() - lastTick;
                 int fps = elapsed > 0 ? (int) ((frames - lastFrames) * 1000 / elapsed) : 0;
-                sb.append("累计帧数: ").append(frames)
-                        .append(String.format(Locale.US, "（约 %d fps）\n", fps));
-            } else {
-                sb.append("累计帧数: ").append(frames).append('\n');
+                sb.append(String.format(Locale.US, "帧率: %d fps\n", fps));
             }
             lastFrames = frames;
             lastTick = System.currentTimeMillis();
