@@ -423,19 +423,32 @@ public final class OnvifServer {
                     + "</td:GetServicesResponse>");
         }
         if (request.contains("GetProfiles")) {
-            // 多摄像头：每路一个 Profile（token=profile_{N+1}，N 为全局相机编号），
-            // Name 体现相机名（前置/后置/外接）；编号直接取注册表，避免位置错位
-            java.util.Map<Integer, String> cams = new java.util.TreeMap<>(MjpegServer.cameras());
-            if (cams.isEmpty()) {
-                // 「只广播真实在推流的相机」：无相机在推流时返回空列表。
-                // 曾经兜底一个假 Profile，客户端拿到取流地址却无流可取，
-                // 被误报成"摄像头未返回任何媒体配置"（Max2.0 实测）
-                return soapBody("<trt:GetProfilesResponse/>");
-            }
+            // 方案 A：始终返回全部物理相机的 Profile（含未推流的），
+            // 未推流的名称加 (inactive) 标记——NVR 枚举时能看到前后两路画面，
+            // 用户自行选择可用的那路；切相机后重新 GetStreamUri 即可取到新流。
+            // 内置相机从 CameraManager 枚举（不依赖推流状态）；UVC 场景回退到
+            // MjpegServer 注册表（UVC 相机始终在推流）。
+            java.util.Map<Integer, String> active = MjpegServer.cameras();
+            java.util.List<String> allLabels = BuiltInCamera.cameraLabels(appContext);
             StringBuilder sb = new StringBuilder("<trt:GetProfilesResponse>");
-            for (Map.Entry<Integer, String> e : cams.entrySet()) {
-                sb.append(profileXml(e.getKey() + 1, e.getValue()));
+            if (!allLabels.isEmpty()) {
+                // 内置相机路径：全部物理相机都出 Profile
+                for (int i = 0; i < allLabels.size(); i++) {
+                    String label = allLabels.get(i);
+                    String activeLabel = active.get(i);
+                    if (activeLabel == null) {
+                        label = label + " (inactive)";
+                    }
+                    sb.append(profileXml(i + 1, label));
+                }
+            } else if (!active.isEmpty()) {
+                // UVC 回退：没有内置相机（或全部失败），列出实际在推流的
+                java.util.Map<Integer, String> sorted = new java.util.TreeMap<>(active);
+                for (Map.Entry<Integer, String> e : sorted.entrySet()) {
+                    sb.append(profileXml(e.getKey() + 1, e.getValue()));
+                }
             }
+            // 两者都空：返回空列表（与此前行为一致，不兜底假 Profile）
             return soapBody(sb.append("</trt:GetProfilesResponse>").toString());
         }
         if (request.contains("GetStreamUri")) {
