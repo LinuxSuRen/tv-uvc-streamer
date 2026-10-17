@@ -65,7 +65,8 @@ public final class OnvifEventBus {
 
     private static final Object LOCK = new Object();
     private static final Map<String, Sub> SUBS = new HashMap<>();
-    private static final Map<String, Long> LAST_PUBLISH = new HashMap<>();
+    /** key → [最近发布时间, 载荷指纹]：同指纹 2s 内合并，载荷变化放行 */
+    private static final Map<String, long[]> LAST_PUBLISH = new HashMap<>();
     private static long seq;
 
     private OnvifEventBus() {
@@ -139,17 +140,20 @@ public final class OnvifEventBus {
         }
     }
 
-    /** 发布一条事件（限频：同 topic+首 source 2s 内合并） */
+    /** 发布一条事件；限频只抑制「同 topic+source 相同载荷」的重复（2s 窗口）——
+     * 状态交替（SignalLoss false→true）载荷不同必须放行，否则快速重启循环里
+     * NVR 只能看到恢复永远看不到丢失 */
     static void publish(String topic, String[][] source, String[][] data) {
         String key = topic + '|' + (source.length > 0 ? source[0][1] : "");
+        String fp = fingerprint(topic, source, data);
         synchronized (LOCK) {
             expireLocked();
-            Long last = LAST_PUBLISH.get(key);
+            long[] last = LAST_PUBLISH.get(key);
             long now = System.currentTimeMillis();
-            if (last != null && now - last < PUBLISH_MIN_INTERVAL_MS) {
+            if (last != null && now - last[0] < PUBLISH_MIN_INTERVAL_MS && last[1] == fp.hashCode()) {
                 return;
             }
-            LAST_PUBLISH.put(key, now);
+            LAST_PUBLISH.put(key, new long[]{now, fp.hashCode()});
             if (SUBS.isEmpty()) {
                 return; // 无人订阅也记限频：避免订阅瞬间补发历史风暴
             }
@@ -163,6 +167,17 @@ public final class OnvifEventBus {
             LOCK.notifyAll();
             Log.d(TAG, "publish " + topic);
         }
+    }
+
+    private static String fingerprint(String topic, String[][] source, String[][] data) {
+        StringBuilder sb = new StringBuilder(topic);
+        for (String[] kv : source) {
+            sb.append('|').append(kv[0]).append('=').append(kv[1]);
+        }
+        for (String[] kv : data) {
+            sb.append('|').append(kv[0]).append('=').append(kv[1]);
+        }
+        return sb.toString();
     }
 
     /** 过期订阅回收（调用方持锁） */
